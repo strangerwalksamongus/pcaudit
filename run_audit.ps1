@@ -10,6 +10,9 @@
     Launch it through run_audit.bat - that handles elevation and the
     execution policy.
 
+    Layout: the bundled tools all live in apps\, so the root of the stick
+    holds only these two scripts, apps\ and RESULTS\.
+
     Paths: every path is built from $PSScriptRoot, so the drive letter the
     USB stick happens to get is irrelevant. Nothing uses the current
     working directory, which after UAC elevation is C:\Windows\System32.
@@ -73,21 +76,27 @@ if (-not $ScriptDir) {
     $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 }
 
-$WinAuditExe = Join-Path $ScriptDir 'WinAudit.exe'
-$DiskInfoExe = Join-Path $ScriptDir 'DiskInfo64.exe'
+# Every bundled tool lives under apps\, which is what keeps the root of the
+# stick down to the two scripts plus RESULTS\. Tools are only ever addressed
+# through $AppsDir; the root holds nothing any of them needs.
+$AppsDir = Join-Path $ScriptDir 'apps'
 
-# librespeed-cli sits one folder down from this script.
-$LibreSpeedExe = Join-Path $ScriptDir 'librespeed\librespeed-cli.exe'
+$WinAuditExe = Join-Path $AppsDir 'WinAudit.exe'
+$DiskInfoExe = Join-Path $AppsDir 'DiskInfo64.exe'
+
+# librespeed-cli keeps its own folder inside apps\.
+$LibreSpeedExe = Join-Path $AppsDir 'librespeed\librespeed-cli.exe'
 
 # CrystalDiskInfo 9.x is NOT a single-file portable app. Without these
 # folders beside the executable it aborts looking for
-# CdiResource\dialog\Graph.html and silently writes no report.
-$CdiResourceDir = Join-Path $ScriptDir 'CdiResource'
-$CdiSmartDir    = Join-Path $ScriptDir 'Smart'
+# CdiResource\dialog\Graph.html and silently writes no report - so they
+# belong in apps\ alongside DiskInfo64.exe, never split away from it.
+$CdiResourceDir = Join-Path $AppsDir 'CdiResource'
+$CdiSmartDir    = Join-Path $AppsDir 'Smart'
 
-# CrystalDiskInfo ignores where you ask it to write and always drops these
-# next to its own executable.
-$DiskInfoTxtSrc = Join-Path $ScriptDir 'DiskInfo.txt'
+# CrystalDiskInfo ignores where you ask it to write and always drops this
+# next to its own executable - which is apps\ now, not the root.
+$DiskInfoTxtSrc = Join-Path $AppsDir 'DiskInfo.txt'
 
 $Hostname = $env:COMPUTERNAME
 
@@ -208,7 +217,7 @@ function Invoke-SpeedTest {
     $ok = Invoke-Tool -FilePath $LibreSpeedExe `
                       -Arguments @('--server', "$SpeedTestServer",
                                    '--concurrent', "$SpeedTestConcurrent", '--json') `
-                      -WorkingDirectory $ScriptDir `
+                      -WorkingDirectory $AppsDir `
                       -TimeoutSec $SpeedTestTimeoutSec `
                       -Name "Speed test ($Medium)" `
                       -StdOutFile $JsonPath
@@ -466,6 +475,20 @@ if (-not $isElevated) {
 }
 
 # Check the tools are here before making anyone answer seven questions.
+# Checked on its own first: if apps\ never made it onto the stick then every
+# check below fails at once, and "everything is missing" hides the one thing
+# actually wrong.
+if (-not (Test-Path -LiteralPath $AppsDir)) {
+    Write-Fail 'The apps\ folder is missing, so none of the audit tools are here.'
+    Write-Info "Expected it at: $AppsDir"
+    Write-Host ''
+    Write-Info 'Copy the whole audit folder to the stick. These two scripts on'
+    Write-Info 'their own cannot do anything without apps\.'
+    Write-Host ''
+    Read-Host '  Press Enter to close'
+    exit 4
+}
+
 $missing = @()
 if (-not (Test-Path -LiteralPath $WinAuditExe))    { $missing += 'WinAudit.exe' }
 if (-not (Test-Path -LiteralPath $DiskInfoExe))    { $missing += 'DiskInfo64.exe' }
@@ -473,10 +496,10 @@ if (-not (Test-Path -LiteralPath $LibreSpeedExe))  { $missing += 'librespeed\lib
 if (-not (Test-Path -LiteralPath $CdiResourceDir)) { $missing += 'CdiResource\ (folder)' }
 if (-not (Test-Path -LiteralPath $CdiSmartDir))    { $missing += 'Smart\ (folder)' }
 if ($missing.Count -gt 0) {
-    Write-Fail "Missing from this folder: $($missing -join ', ')"
-    Write-Info "Expected next to this script, in: $ScriptDir"
+    Write-Fail "Missing from apps\: $($missing -join ', ')"
+    Write-Info "Expected inside: $AppsDir"
     Write-Host ''
-    Write-Info 'Copy the WHOLE CrystalDiskInfo folder to the stick, not just the'
+    Write-Info 'Copy the WHOLE CrystalDiskInfo folder into apps\, not just the'
     Write-Info 'exe. Without CdiResource\ it fails looking for Graph.html.'
     Write-Host ''
     Read-Host '  Press Enter to close'
@@ -680,7 +703,7 @@ foreach ($fmt in $WinAuditFormats) {
     )
 
     if (-not (Invoke-Tool -FilePath $WinAuditExe -Arguments $winAuditArgs `
-                          -WorkingDirectory $ScriptDir -TimeoutSec $WinAuditTimeoutSec `
+                          -WorkingDirectory $AppsDir -TimeoutSec $WinAuditTimeoutSec `
                           -Name "WinAudit ($fmt)")) {
         continue
     }
@@ -752,7 +775,7 @@ if (Test-Path -LiteralPath $DiskInfoTxtSrc) {
 }
 
 if (Invoke-Tool -FilePath $DiskInfoExe -Arguments @('/CopyExit') `
-                -WorkingDirectory $ScriptDir -TimeoutSec $DiskInfoTimeoutSec -Name 'CrystalDiskInfo') {
+                -WorkingDirectory $AppsDir -TimeoutSec $DiskInfoTimeoutSec -Name 'CrystalDiskInfo') {
 
     if (Test-Path -LiteralPath $DiskInfoTxtSrc) {
         Move-Item -LiteralPath $DiskInfoTxtSrc -Destination $diskInfoDest -Force
