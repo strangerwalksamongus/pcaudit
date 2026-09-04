@@ -310,31 +310,67 @@ function Get-AnswersGui {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text            = "Computer Audit  -  $Hostname"
-    $form.ClientSize      = New-Object System.Drawing.Size(660, 752)
     $form.StartPosition   = 'CenterScreen'
-    $form.FormBorderStyle = 'FixedDialog'
-    $form.MaximizeBox     = $false
+    $form.FormBorderStyle = 'Sizable'
+    $form.MaximizeBox     = $true
     $form.MinimizeBox     = $false
     $form.Font            = New-Object System.Drawing.Font('Segoe UI', 9)
     $form.Tag             = ''
 
+    # Buttons go in a panel docked to the bottom, and the questions in a
+    # scrolling panel above it. That way Save and Cancel can never be pushed
+    # off the bottom of the screen, which is what happened on 768px-high
+    # laptops when everything sat on the form directly.
+    # FlowLayoutPanel, not a plain Panel with anchored buttons. Anchoring works
+    # off the parent's size at the moment the child is added, and this panel is
+    # still its default 200px wide until it gets docked - so anchored buttons
+    # end up positioned off the right edge once it grows.
+    $panelButtons = New-Object System.Windows.Forms.FlowLayoutPanel
+    $panelButtons.Dock          = 'Bottom'
+    $panelButtons.Height        = 46
+    $panelButtons.FlowDirection = 'RightToLeft'
+    $panelButtons.WrapContents  = $false
+    $panelButtons.Padding       = New-Object System.Windows.Forms.Padding(0, 8, 14, 0)
+
+    $panelMain = New-Object System.Windows.Forms.Panel
+    $panelMain.Dock       = 'Fill'
+    $panelMain.AutoScroll = $true
+
     # --- builders, to keep the layout below readable ---
+    #
+    # Content is kept inside x=14..624 so a vertical scrollbar can appear
+    # without also triggering a horizontal one.
 
     function New-QLabel {
-        param([string]$Text, [int]$Y, [int]$Width = 630)
+        param([string]$Text, [int]$Y, [int]$Width = 610, [int]$X = 14)
         $l = New-Object System.Windows.Forms.Label
         $l.Text     = $Text
-        $l.Location = New-Object System.Drawing.Point(14, $Y)
+        $l.Location = New-Object System.Drawing.Point($X, $Y)
         $l.Size     = New-Object System.Drawing.Size($Width, 18)
         return $l
     }
 
     function New-QText {
-        param([int]$Y)
+        param([int]$Y, [int]$Width = 610, [int]$X = 14)
         $t = New-Object System.Windows.Forms.TextBox
-        $t.Location = New-Object System.Drawing.Point(14, $Y)
-        $t.Size     = New-Object System.Drawing.Size(630, 24)
+        $t.Location = New-Object System.Drawing.Point($X, $Y)
+        $t.Size     = New-Object System.Drawing.Size($Width, 24)
         return $t
+    }
+
+    # One row: caption on the left, button, then a status label. Keeps each of
+    # the three long-running actions to 26px instead of a label-plus-button
+    # stack.
+    function New-ActionRow {
+        param([string]$Caption, [string]$ButtonText, [int]$Y)
+        $cap = New-QLabel $Caption ($Y + 4) 210
+        $btn = New-Object System.Windows.Forms.Button
+        $btn.Text     = $ButtonText
+        $btn.Location = New-Object System.Drawing.Point(230, $Y)
+        $btn.Size     = New-Object System.Drawing.Size(115, 26)
+        $lbl = New-QLabel 'Not run yet' ($Y + 5) 269 355
+        $lbl.ForeColor = [System.Drawing.Color]::DimGray
+        return @{ Caption = $cap; Button = $btn; Label = $lbl }
     }
 
     # Each Yes/No pair needs its own panel - radios group by parent, so four
@@ -344,7 +380,7 @@ function Get-AnswersGui {
     function New-YesNo {
         param([string]$Key, [int]$Y)
         $panel = New-Object System.Windows.Forms.Panel
-        $panel.Location = New-Object System.Drawing.Point(474, $Y)
+        $panel.Location = New-Object System.Drawing.Point(454, $Y)
         $panel.Size     = New-Object System.Drawing.Size(170, 24)
 
         $yes = New-Object System.Windows.Forms.RadioButton
@@ -366,84 +402,82 @@ function Get-AnswersGui {
 
     # --- layout ---
 
-    $intro = New-QLabel "Fill this in for $Hostname, then press Save and continue." 12
+    $intro = New-QLabel "Fill this in for $Hostname, then press Save and continue." 10
     $intro.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 
-    $txtRealName = New-QText 64
-    $txtLogin    = New-QText 116
-    $txtMailbox  = New-QText 470
+    # 1 and 2 share a row - both answers are short, and the two of them stacked
+    # cost 52px of height for no benefit.
+    $txtRealName = New-QText 56 300 14
+    $txtLogin    = New-QText 56 300 324
 
-    # Sits above the speed tests so it gets started first - WinAudit and CDI
-    # then run while the rest of the form is being filled in.
-    $btnAudit = New-Object System.Windows.Forms.Button
-    $btnAudit.Text     = 'Run audit apps'
-    $btnAudit.Location = New-Object System.Drawing.Point(14, 170)
-    $btnAudit.Size     = New-Object System.Drawing.Size(150, 26)
+    # Mailbox answer is short too, so it doesn't need the full width.
+    $txtMailbox  = New-QText 328 300 14
 
-    $lblAudit = New-Object System.Windows.Forms.Label
-    $lblAudit.Text      = 'Not run yet'
-    $lblAudit.Location  = New-Object System.Drawing.Point(176, 175)
-    $lblAudit.Size      = New-Object System.Drawing.Size(470, 18)
-    $lblAudit.ForeColor = [System.Drawing.Color]::DimGray
+    # The applications audit goes first so it gets started before the speed
+    # tests - WinAudit and CDI then run while the rest is being filled in.
+    $rowAudit = New-ActionRow 'Applications audit (WinAudit + CDI)' 'Run audit apps' 92
+    $rowWifi  = New-ActionRow '3. Internet speed test - WiFi'       'Run test'       124
+    $rowCable = New-ActionRow '4. Internet speed test - cable'      'Run test'       156
 
-    $btnWifi = New-Object System.Windows.Forms.Button
-    $btnWifi.Text     = 'Run test'
-    $btnWifi.Location = New-Object System.Drawing.Point(14, 228)
-    $btnWifi.Size     = New-Object System.Drawing.Size(150, 26)
-
-    $lblWifi = New-Object System.Windows.Forms.Label
-    $lblWifi.Text      = 'Not tested'
-    $lblWifi.Location  = New-Object System.Drawing.Point(176, 233)
-    $lblWifi.Size      = New-Object System.Drawing.Size(470, 18)
-    $lblWifi.ForeColor = [System.Drawing.Color]::DimGray
-
-    $btnCable = New-Object System.Windows.Forms.Button
-    $btnCable.Text     = 'Run test'
-    $btnCable.Location = New-Object System.Drawing.Point(14, 286)
-    $btnCable.Size     = New-Object System.Drawing.Size(150, 26)
-
-    $lblCable = New-Object System.Windows.Forms.Label
-    $lblCable.Text      = 'Not tested'
-    $lblCable.Location  = New-Object System.Drawing.Point(176, 291)
-    $lblCable.Size      = New-Object System.Drawing.Size(470, 18)
-    $lblCable.ForeColor = [System.Drawing.Color]::DimGray
+    $btnAudit = $rowAudit.Button ; $lblAudit = $rowAudit.Label
+    $btnWifi  = $rowWifi.Button  ; $lblWifi  = $rowWifi.Label
+    $btnCable = $rowCable.Button ; $lblCable = $rowCable.Label
+    $lblWifi.Text  = 'Not tested'
+    $lblCable.Text = 'Not tested'
 
     $txtIssues = New-Object System.Windows.Forms.TextBox
-    $txtIssues.Location   = New-Object System.Drawing.Point(14, 524)
-    $txtIssues.Size       = New-Object System.Drawing.Size(630, 140)
+    $txtIssues.Location   = New-Object System.Drawing.Point(14, 380)
+    $txtIssues.Size       = New-Object System.Drawing.Size(610, 95)
     $txtIssues.Multiline  = $true
     $txtIssues.ScrollBars = 'Vertical'
     $txtIssues.AcceptsTab = $false
     $txtIssues.WordWrap   = $true
 
-    $hint = New-QLabel 'Questions 1, 2 and 9 are required. Question 10 may be left blank.' 674
+    $hint = New-QLabel 'Questions 1, 2 and 9 are required. Question 10 may be left blank.' 483
     $hint.ForeColor = [System.Drawing.Color]::DimGray
 
     $btnOk = New-Object System.Windows.Forms.Button
-    $btnOk.Text     = 'Save and continue'
-    $btnOk.Location = New-Object System.Drawing.Point(414, 706)
-    $btnOk.Size     = New-Object System.Drawing.Size(130, 30)
+    $btnOk.Text = 'Save and continue'
+    $btnOk.Size = New-Object System.Drawing.Size(130, 30)
 
     $btnCancel = New-Object System.Windows.Forms.Button
-    $btnCancel.Text     = 'Cancel'
-    $btnCancel.Location = New-Object System.Drawing.Point(554, 706)
-    $btnCancel.Size     = New-Object System.Drawing.Size(90, 30)
+    $btnCancel.Text = 'Cancel'
+    $btnCancel.Size = New-Object System.Drawing.Size(90, 30)
 
-    $form.Controls.AddRange(@(
+    # Right-to-left flow, so the first one added sits furthest right.
+    $panelButtons.Controls.AddRange(@($btnCancel, $btnOk))
+
+    $panelMain.Controls.AddRange(@(
         $intro,
-        (New-QLabel '1. The real name of the main user using this computer' 44), $txtRealName,
-        (New-QLabel '2. The username that authenticates on this computer (e.g. firstname.lastname)' 96), $txtLogin,
-        (New-QLabel 'Applications audit - WinAudit and CrystalDiskInfo (start this first)' 148), $btnAudit, $lblAudit,
-        (New-QLabel '3. Internet speed test - WiFi' 206), $btnWifi, $lblWifi,
-        (New-QLabel '4. Internet speed test - cable' 264), $btnCable, $lblCable,
-        (New-QLabel '5. Does the user have admin access to the pc?' 326 450),            (New-YesNo 'admin'     324),
-        (New-QLabel '6. Does the user have a password set for authentication?' 356 450), (New-YesNo 'password' 354),
-        (New-QLabel '7. Is an antivirus installed on this PC?' 386 450),                 (New-YesNo 'antivirus' 384),
-        (New-QLabel '8. Is there a windows sticker on the PC?' 416 450),                 (New-YesNo 'sticker'   414),
-        (New-QLabel "9. What is the user's free email space and total capacity?  [occupied/total space]" 450), $txtMailbox,
-        (New-QLabel '10. What are the main technical issues for this user?' 504), $txtIssues,
-        $hint, $btnOk, $btnCancel
+        (New-QLabel '1. Real name of the main user' 36 300 14),
+        (New-QLabel '2. Username they log in with' 36 300 324),
+        $txtRealName, $txtLogin,
+        $rowAudit.Caption, $btnAudit, $lblAudit,
+        $rowWifi.Caption,  $btnWifi,  $lblWifi,
+        $rowCable.Caption, $btnCable, $lblCable,
+        (New-QLabel '5. Does the user have admin access to the pc?' 192 430),            (New-YesNo 'admin'     190),
+        (New-QLabel '6. Does the user have a password set for authentication?' 220 430), (New-YesNo 'password' 218),
+        (New-QLabel '7. Is an antivirus installed on this PC?' 248 430),                 (New-YesNo 'antivirus' 246),
+        (New-QLabel '8. Is there a windows sticker on the PC?' 276 430),                 (New-YesNo 'sticker'   274),
+        (New-QLabel "9. Free email space / total capacity  [occupied/total]" 308),        $txtMailbox,
+        (New-QLabel '10. Main technical issues for this user' 360),                       $txtIssues,
+        $hint
     ))
+
+    # Fill panel added first, docked panel second: docking is applied from the
+    # end of the Controls collection backwards, so the buttons reserve their
+    # strip and the scrolling panel takes whatever is left.
+    $form.Controls.AddRange(@($panelMain, $panelButtons))
+
+    # Never open taller than the screen. If the desktop can't fit the whole
+    # form, shrink it and let $panelMain scroll - the buttons stay put either
+    # way because they're docked outside it.
+    $wanted  = 555
+    $working = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height
+    $maxOpen = $working - 70
+    if ($wanted -gt $maxOpen) { $wanted = $maxOpen }
+    $form.ClientSize   = New-Object System.Drawing.Size(646, $wanted)
+    $form.MinimumSize  = New-Object System.Drawing.Size(500, 300)
 
     # --- long-running buttons ---
     #
@@ -573,6 +607,20 @@ function Get-AnswersGui {
             [System.Windows.Forms.MessageBoxButtons]::YesNo,
             [System.Windows.Forms.MessageBoxIcon]::Question)
         if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) { $form.Close() }
+    })
+
+    # Belt and braces for display scaling and odd resolutions. WinForms scales
+    # the whole form at anything above 100% DPI, which happens after our sizing
+    # above, so measure once the window is really on screen: shrink it to the
+    # monitor it landed on and drag it back into view if it overhangs an edge.
+    # Shrinking can never hide the buttons, since they are docked.
+    $form.Add_Shown({
+        $wa = [System.Windows.Forms.Screen]::FromControl($form).WorkingArea
+        if ($form.Height -gt $wa.Height) { $form.Height = $wa.Height }
+        if ($form.Width  -gt $wa.Width)  { $form.Width  = $wa.Width }
+        if ($form.Bottom -gt $wa.Bottom) { $form.Top  = [Math]::Max($wa.Top,  $wa.Bottom - $form.Height) }
+        if ($form.Right  -gt $wa.Right)  { $form.Left = [Math]::Max($wa.Left, $wa.Right  - $form.Width) }
+        $form.Activate()
     })
 
     Write-Info 'Answer the questions in the window that just opened.'
