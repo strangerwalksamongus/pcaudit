@@ -18,6 +18,13 @@
     working directory, which after UAC elevation is C:\Windows\System32.
 #>
 
+param(
+    # Ask the ten questions in the console instead of on a form, exactly as
+    # earlier versions did. The script also falls back to this on its own if
+    # no form can be shown (no desktop session, or a non-STA host).
+    [switch]$Console
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -118,6 +125,32 @@ function Write-Fail { param([string]$Text) Write-Host "  [FAIL]   $Text" -Foregr
 function Write-Warn { param([string]$Text) Write-Host "  [WARN]   $Text" -ForegroundColor Yellow }
 function Write-Info { param([string]$Text) Write-Host "  $Text" -ForegroundColor Gray }
 
+# The console only gets in the way while the form is up - the form carries its
+# own progress, and a console in front of it invites clicking the wrong window.
+# Minimised rather than hidden, so it can still be brought back by hand, and
+# so it is already on the taskbar when we restore it afterwards.
+#
+# The P/Invoke type is compiled on first use rather than at startup: console
+# mode never calls this, and there is no reason to make it pay for the compile.
+function Set-ConsoleWindowState {
+    param([ValidateSet('Minimised', 'Restored')][string]$State)
+    try {
+        if (-not ('AuditNative.ConsoleWindow' -as [type])) {
+            Add-Type -Namespace AuditNative -Name ConsoleWindow -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")]   public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+'@ -ErrorAction Stop
+        }
+        $hwnd = [AuditNative.ConsoleWindow]::GetConsoleWindow()
+        if ($hwnd -eq [IntPtr]::Zero) { return }
+        # 6 = SW_MINIMIZE, 9 = SW_RESTORE
+        [void][AuditNative.ConsoleWindow]::ShowWindow($hwnd, $(if ($State -eq 'Minimised') { 6 } else { 9 }))
+    } catch {
+        # Purely cosmetic; never let a window-state call take down the audit.
+        Write-Log "Console window could not be set to $State - $($_.Exception.Message)"
+    }
+}
+
 # Log lines are collected in memory and flushed to audit.log at the end,
 # and also flushed after each tool runs so a yanked stick still leaves
 # something behind.
@@ -126,6 +159,16 @@ $script:LogLines = New-Object System.Collections.ArrayList
 # so a plain $LogPath here would collide with any local $logPath elsewhere in
 # the script and silently redirect the audit trail to the wrong file.
 $script:AuditLogPath = $null
+
+# Set only while the GUI is waiting on a tool, so Invoke-Tool's poll loop can
+# keep the form repainting instead of letting Windows grey it out as "Not
+# Responding". Stays false in console mode, where there is nothing to pump.
+$script:PumpUiEvents = $false
+
+# Where Invoke-Tool writes its elapsed counter while the GUI is up. The
+# console is minimised behind the form by then, so without this the operator
+# has nowhere to see that a tool is still working.
+$script:UiStatusLabel = $null
 
 function Write-Log {
     param([string]$Text)
@@ -205,10 +248,13 @@ function Invoke-SpeedTest {
     param(
         [string]$Number,
         [string]$Medium,
-        [string]$JsonPath
+        [string]$JsonPath,
+        # The GUI has its own button for this, so it asks for the test
+        # directly rather than through a console Y/N prompt.
+        [switch]$NoPrompt
     )
 
-    if (-not (Read-YesNo "$Number. Run internet speed test on ${Medium}?")) {
+    if (-not $NoPrompt -and -not (Read-YesNo "$Number. Run internet speed test on ${Medium}?")) {
         return @('Not tested', 'Not tested')
     }
 
@@ -243,6 +289,375 @@ function Invoke-SpeedTest {
     Write-Log "Speed test ($Medium): down=$down up=$up ping=$($result.ping)ms jitter=$($result.jitter)ms"
     Write-Log "Speed test ($Medium): raw JSON saved as $(Split-Path -Leaf $JsonPath)"
     return @($down, $up)
+}
+
+# ------------------------------------------------------------------
+#  GUI front end
+#
+#  The same ten questions as the console flow, on one form, with a real
+#  multi-line box for the technical issues. Builds and returns the usual
+#  $answers hashtable, so nothing downstream needs to know which front end
+#  was used.
+#
+#  Returns $null when a form cannot be shown; the caller then falls through
+#  to the console interview rather than failing.
+#
+#  There is no confirm-and-repeat loop here on purpose: every answer stays
+#  visible and editable until OK is pressed, so the form is its own review
+#  step, and fixing a typo no longer costs a repeat of both speed tests.
+# ------------------------------------------------------------------
+
+function Get-AnswersGui {
+
+    # A form needs an STA thread. powershell.exe gives us one, but pwsh.exe
+    # defaults to MTA, so measure it rather than assume.
+    if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+        Write-Log 'GUI: thread is not STA, using the console questions instead.'
+        return $null
+    }
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+        [System.Windows.Forms.Application]::EnableVisualStyles()
+    } catch {
+        Write-Log "GUI: WinForms is not available - $($_.Exception.Message)"
+        return $null
+    }
+
+    # Kept in a hashtable rather than two plain variables. A button handler
+    # runs in its own scope, so assigning to a variable there would never
+    # reach us; writing into a hashtable mutates the one object we share.
+    $speeds = @{
+        wifi  = @('Not tested', 'Not tested')
+        cable = @('Not tested', 'Not tested')
+    }
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text            = "Computer Audit  -  $Hostname"
+    $form.ClientSize      = New-Object System.Drawing.Size(660, 752)
+    $form.StartPosition   = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox     = $false
+    $form.MinimizeBox     = $false
+    $form.Font            = New-Object System.Drawing.Font('Segoe UI', 9)
+    $form.Tag             = ''
+
+    # --- small builders, so the layout below stays readable ---
+
+    function New-QLabel {
+        param([string]$Text, [int]$Y, [int]$Width = 630)
+        $l = New-Object System.Windows.Forms.Label
+        $l.Text     = $Text
+        $l.Location = New-Object System.Drawing.Point(14, $Y)
+        $l.Size     = New-Object System.Drawing.Size($Width, 18)
+        return $l
+    }
+
+    function New-QText {
+        param([int]$Y)
+        $t = New-Object System.Windows.Forms.TextBox
+        $t.Location = New-Object System.Drawing.Point(14, $Y)
+        $t.Size     = New-Object System.Drawing.Size(630, 24)
+        return $t
+    }
+
+    # Each Yes/No pair needs its own container: radio buttons group by
+    # parent, so four pairs on the bare form would behave as one group of
+    # eight. Both start unchecked - the console flow refuses to treat a
+    # non-answer as "No", and the form must not be laxer than it was.
+    $radios = @{}
+    function New-YesNo {
+        param([string]$Key, [int]$Y)
+        $panel = New-Object System.Windows.Forms.Panel
+        $panel.Location = New-Object System.Drawing.Point(474, $Y)
+        $panel.Size     = New-Object System.Drawing.Size(170, 24)
+
+        $yes = New-Object System.Windows.Forms.RadioButton
+        $yes.Text     = 'Yes'
+        $yes.Location = New-Object System.Drawing.Point(0, 2)
+        $yes.Size     = New-Object System.Drawing.Size(55, 20)
+        $yes.Checked  = $false
+
+        $no = New-Object System.Windows.Forms.RadioButton
+        $no.Text     = 'No'
+        $no.Location = New-Object System.Drawing.Point(70, 2)
+        $no.Size     = New-Object System.Drawing.Size(55, 20)
+        $no.Checked  = $false
+
+        $panel.Controls.AddRange(@($yes, $no))
+        $radios[$Key] = @{ Yes = $yes; No = $no }
+        return $panel
+    }
+
+    # --- layout ---
+
+    $intro = New-QLabel "Fill this in for $Hostname, then press Save and continue." 12
+    $intro.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+
+    $txtRealName = New-QText 64
+    $txtLogin    = New-QText 116
+    $txtMailbox  = New-QText 470
+
+    # The applications audit sits above the speed tests so it can be started
+    # first: WinAudit and CrystalDiskInfo then work through their few minutes
+    # while the rest of the form is still being filled in.
+    $btnAudit = New-Object System.Windows.Forms.Button
+    $btnAudit.Text     = 'Run audit apps'
+    $btnAudit.Location = New-Object System.Drawing.Point(14, 170)
+    $btnAudit.Size     = New-Object System.Drawing.Size(150, 26)
+
+    $lblAudit = New-Object System.Windows.Forms.Label
+    $lblAudit.Text      = 'Not run yet'
+    $lblAudit.Location  = New-Object System.Drawing.Point(176, 175)
+    $lblAudit.Size      = New-Object System.Drawing.Size(470, 18)
+    $lblAudit.ForeColor = [System.Drawing.Color]::DimGray
+
+    $btnWifi = New-Object System.Windows.Forms.Button
+    $btnWifi.Text     = 'Run test'
+    $btnWifi.Location = New-Object System.Drawing.Point(14, 228)
+    $btnWifi.Size     = New-Object System.Drawing.Size(150, 26)
+
+    $lblWifi = New-Object System.Windows.Forms.Label
+    $lblWifi.Text      = 'Not tested'
+    $lblWifi.Location  = New-Object System.Drawing.Point(176, 233)
+    $lblWifi.Size      = New-Object System.Drawing.Size(470, 18)
+    $lblWifi.ForeColor = [System.Drawing.Color]::DimGray
+
+    $btnCable = New-Object System.Windows.Forms.Button
+    $btnCable.Text     = 'Run test'
+    $btnCable.Location = New-Object System.Drawing.Point(14, 286)
+    $btnCable.Size     = New-Object System.Drawing.Size(150, 26)
+
+    $lblCable = New-Object System.Windows.Forms.Label
+    $lblCable.Text      = 'Not tested'
+    $lblCable.Location  = New-Object System.Drawing.Point(176, 291)
+    $lblCable.Size      = New-Object System.Drawing.Size(470, 18)
+    $lblCable.ForeColor = [System.Drawing.Color]::DimGray
+
+    $txtIssues = New-Object System.Windows.Forms.TextBox
+    $txtIssues.Location   = New-Object System.Drawing.Point(14, 524)
+    $txtIssues.Size       = New-Object System.Drawing.Size(630, 140)
+    $txtIssues.Multiline  = $true
+    $txtIssues.ScrollBars = 'Vertical'
+    $txtIssues.AcceptsTab = $false
+    $txtIssues.WordWrap   = $true
+
+    $hint = New-QLabel 'Questions 1, 2 and 9 are required. Question 10 may be left blank.' 674
+    $hint.ForeColor = [System.Drawing.Color]::DimGray
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text     = 'Save and continue'
+    $btnOk.Location = New-Object System.Drawing.Point(414, 706)
+    $btnOk.Size     = New-Object System.Drawing.Size(130, 30)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text     = 'Cancel'
+    $btnCancel.Location = New-Object System.Drawing.Point(554, 706)
+    $btnCancel.Size     = New-Object System.Drawing.Size(90, 30)
+
+    $form.Controls.AddRange(@(
+        $intro,
+        (New-QLabel '1. The real name of the main user using this computer' 44), $txtRealName,
+        (New-QLabel '2. The username that authenticates on this computer (e.g. firstname.lastname)' 96), $txtLogin,
+        (New-QLabel 'Applications audit - WinAudit and CrystalDiskInfo (start this first)' 148), $btnAudit, $lblAudit,
+        (New-QLabel '3. Internet speed test - WiFi' 206), $btnWifi, $lblWifi,
+        (New-QLabel '4. Internet speed test - cable' 264), $btnCable, $lblCable,
+        (New-QLabel '5. Does the user have admin access to the pc?' 326 450),            (New-YesNo 'admin'     324),
+        (New-QLabel '6. Does the user have a password set for authentication?' 356 450), (New-YesNo 'password' 354),
+        (New-QLabel '7. Is an antivirus installed on this PC?' 386 450),                 (New-YesNo 'antivirus' 384),
+        (New-QLabel '8. Is there a windows sticker on the PC?' 416 450),                 (New-YesNo 'sticker'   414),
+        (New-QLabel "9. What is the user's free email space and total capacity?  [occupied/total space]" 450), $txtMailbox,
+        (New-QLabel '10. What are the main technical issues for this user?' 504), $txtIssues,
+        $hint, $btnOk, $btnCancel
+    ))
+
+    # --- long-running buttons ---
+    #
+    # All of this runs inline on the UI thread. Invoke-Tool polls rather than
+    # blocks, and $script:PumpUiEvents makes that poll loop pump the message
+    # queue, so the window keeps repainting through the minutes a tool can
+    # take. $script:UiStatusLabel gives the loop somewhere on the form to put
+    # its elapsed counter, which matters because the console is minimised
+    # behind us and is no longer somewhere the operator can watch.
+    #
+    # Every button is disabled for the duration. Two tools competing for the
+    # same DiskInfo.txt, or an OK press landing mid-run, are not worth the
+    # convenience of leaving them live.
+
+    function Set-GuiBusy {
+        param([bool]$Busy)
+        foreach ($b in @($btnAudit, $btnWifi, $btnCable, $btnOk, $btnCancel)) {
+            $b.Enabled = -not $Busy
+        }
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    function Invoke-GuiSpeedTest {
+        param([string]$Number, [string]$Medium, [string]$JsonName, $Button, $Label)
+
+        Set-GuiBusy $true
+        $Label.ForeColor = [System.Drawing.Color]::DimGray
+        $Label.Text      = 'Starting...'
+
+        # Nothing a tool does may be allowed to tear down the form: at this
+        # point the operator's typed answers exist only in these text boxes,
+        # and letting an exception escape would throw them away.
+        $res = @('Test failed', 'Test failed')
+
+        $script:UiStatusLabel = $Label
+        $script:PumpUiEvents  = $true
+        try {
+            $res = Invoke-SpeedTest -Number $Number -Medium $Medium `
+                                    -JsonPath (Join-Path $ExportDir $JsonName) -NoPrompt
+        } catch {
+            Write-Log "Speed test ($Medium) threw - $($_.Exception.Message)"
+        } finally {
+            $script:PumpUiEvents  = $false
+            $script:UiStatusLabel = $null
+            Set-GuiBusy $false
+        }
+
+        if ($res[0] -eq 'Test failed') {
+            $Label.Text      = 'Test failed - see audit.log. You can try again.'
+            $Label.ForeColor = [System.Drawing.Color]::Firebrick
+        } else {
+            $Label.Text      = '{0} down / {1} up' -f $res[0], $res[1]
+            $Label.ForeColor = [System.Drawing.Color]::ForestGreen
+            $Button.Text     = 'Re-test'
+        }
+        return $res
+    }
+
+    function Invoke-GuiAuditTools {
+        Set-GuiBusy $true
+        $lblAudit.ForeColor = [System.Drawing.Color]::DimGray
+        $lblAudit.Text      = 'Starting...'
+
+        $script:UiStatusLabel = $lblAudit
+        $script:PumpUiEvents  = $true
+        try {
+            Invoke-AuditTools
+        } catch {
+            # Same reasoning as the speed test: the answers are still only in
+            # the form. Record the failure, show it, and let the operator carry
+            # on - the main flow reports it again at the end from the same flags.
+            Write-Log "Applications audit threw - $($_.Exception.Message)"
+        } finally {
+            $script:PumpUiEvents  = $false
+            $script:UiStatusLabel = $null
+            Set-GuiBusy $false
+        }
+
+        $btnAudit.Text = 'Run again'
+        if ($script:WinAuditOk -and $script:DiskInfoOk) {
+            $lblAudit.Text      = 'Done - WinAudit and disk / SMART reports saved.'
+            $lblAudit.ForeColor = [System.Drawing.Color]::ForestGreen
+        } else {
+            $parts = @()
+            $parts += $(if ($script:WinAuditOk) { 'WinAudit OK' }    else { 'WinAudit FAILED' })
+            $parts += $(if ($script:DiskInfoOk) { 'disk report OK' } else { 'disk report FAILED' })
+            $lblAudit.Text      = ($parts -join ', ') + ' - see audit.log'
+            $lblAudit.ForeColor = [System.Drawing.Color]::Firebrick
+        }
+    }
+
+    $btnAudit.Add_Click({ Invoke-GuiAuditTools })
+
+    $btnWifi.Add_Click({
+        $speeds['wifi'] = Invoke-GuiSpeedTest '3' 'wifi' 'wifispeedtest.json' $btnWifi $lblWifi
+    })
+
+    $btnCable.Add_Click({
+        $speeds['cable'] = Invoke-GuiSpeedTest '4' 'cable' 'cablespeedtest.json' $btnCable $lblCable
+    })
+
+    # --- buttons ---
+
+    $btnOk.Add_Click({
+        $problems = New-Object System.Collections.ArrayList
+        if (-not $txtRealName.Text.Trim()) { [void]$problems.Add('Question 1 - the real name is required.') }
+        if (-not $txtLogin.Text.Trim())    { [void]$problems.Add('Question 2 - the username is required.') }
+        if (-not $txtMailbox.Text.Trim())  { [void]$problems.Add('Question 9 - the email space is required.') }
+        foreach ($k in @('admin', 'password', 'antivirus', 'sticker')) {
+            if (-not ($radios[$k].Yes.Checked -or $radios[$k].No.Checked)) {
+                [void]$problems.Add("Question $(@{admin=5; password=6; antivirus=7; sticker=8}[$k]) - answer Yes or No.")
+            }
+        }
+        if ($problems.Count) {
+            [void][System.Windows.Forms.MessageBox]::Show(
+                $form,
+                ("Please finish these first:`r`n`r`n" + ($problems -join "`r`n")),
+                'Incomplete',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning)
+            return
+        }
+        $form.Tag = 'ok'
+        $form.Close()
+    })
+
+    $btnCancel.Add_Click({
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            $form,
+            'Cancel the audit? Nothing has been saved yet.',
+            'Cancel audit',
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question)
+        if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) { $form.Close() }
+    })
+
+    Write-Info 'Answer the questions in the window that just opened.'
+
+    # Out of the way while the form has the screen. The finally guarantees it
+    # comes back even if something in the dialog throws - leaving the operator
+    # with a minimised console and no window would look like a crash.
+    Set-ConsoleWindowState -State 'Minimised'
+    try {
+        [void]$form.ShowDialog()
+    } finally {
+        Set-ConsoleWindowState -State 'Restored'
+    }
+
+    # Closing with the X behaves like Cancel. Falling back to the console
+    # after someone deliberately closed the window would just be ignoring
+    # them, so this ends the run instead.
+    if ([string]$form.Tag -ne 'ok') {
+        $form.Dispose()
+        Write-Log 'GUI: cancelled by the operator, nothing was written.'
+        Write-Host ''
+        Write-Warn 'Cancelled. No files were written.'
+        Write-Host ''
+        Read-Host '  Press Enter to close'
+        exit 6
+    }
+
+    $yn = { param($k) if ($radios[$k].Yes.Checked) { 'Yes' } else { 'No' } }
+
+    $issues = $txtIssues.Text.Trim()
+    if (-not $issues) { $issues = 'None reported' }
+
+    $result = [ordered]@{
+        'Hostname'             = $Hostname
+        'Real name'            = $txtRealName.Text.Trim()
+        'Login username'       = $txtLogin.Text.Trim()
+        'WiFi download'        = $speeds['wifi'][0]
+        'WiFi upload'          = $speeds['wifi'][1]
+        'Cable download'       = $speeds['cable'][0]
+        'Cable upload'         = $speeds['cable'][1]
+        'Admin access'         = (& $yn 'admin')
+        'Password set'         = (& $yn 'password')
+        'Antivirus'            = (& $yn 'antivirus')
+        'Windows sticker'      = (& $yn 'sticker')
+        'Email space'          = $txtMailbox.Text.Trim()
+        'Technical issues'     = $issues
+        'Audited by'           = $identity.Name
+        'Audit date'           = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    }
+
+    $form.Dispose()
+    Write-Log 'Answers collected from the GUI.'
+    return $result
 }
 
 # ------------------------------------------------------------------
@@ -298,6 +713,12 @@ function Invoke-Tool {
         }
         Write-Host ("`r    still running... {0:mm\:ss} elapsed  (do not close this window)" -f $sw.Elapsed) `
                    -NoNewline -ForegroundColor DarkGray
+        if ($script:PumpUiEvents) {
+            if ($script:UiStatusLabel) {
+                $script:UiStatusLabel.Text = '{0}: {1:mm\:ss} elapsed, please wait...' -f $Name, $sw.Elapsed
+            }
+            [System.Windows.Forms.Application]::DoEvents()
+        }
         Start-Sleep -Milliseconds 500
     }
     Write-Host "`r$(' ' * 70)`r" -NoNewline
@@ -398,6 +819,29 @@ function Format-AuditPairs {
     return $out
 }
 
+# Question 10 can arrive as several lines now that the GUI gives it a
+# multi-line box. Put the first line against the label and indent the rest
+# underneath, so a multi-line answer cannot knock the two-column layout out
+# of true. Single-line values come out byte-identical to the old formatting.
+function Format-LabelledValue {
+    param(
+        [string]$Label,
+        [string]$Value,
+        [int]   $Pad,
+        [string]$Prefix    = '',
+        [string]$Separator = ': '
+    )
+    $lines  = @(([string]$Value) -split "`r?`n")
+    $indent = '{0}{1}{2}' -f $Prefix, (' ' * $Pad), (' ' * $Separator.Length)
+    $out    = New-Object System.Collections.ArrayList
+
+    [void]$out.Add(('{0}{1}{2}{3}' -f $Prefix, $Label.PadRight($Pad), $Separator, $lines[0]).TrimEnd())
+    for ($i = 1; $i -lt $lines.Count; $i++) {
+        [void]$out.Add(($indent + $lines[$i]).TrimEnd())
+    }
+    return $out
+}
+
 # Windows licence channel and partial key. None of this appears in any of
 # the tool exports - WinAudit only reports the Product ID, which is an
 # install identifier and says nothing about how the machine is licensed.
@@ -454,6 +898,161 @@ function Get-DiskInfoSummary {
         if ($keep) { [void]$out.Add($line.TrimEnd()) }
     }
     return $out
+}
+
+# ------------------------------------------------------------------
+#  Applications audit
+#
+#  WinAudit and CrystalDiskInfo, plus all the post-processing that goes
+#  with them. This lives in a function so both front ends can drive it:
+#  the console flow calls it in sequence as it always did, while the GUI
+#  runs it from its own button, letting the tools work through their few
+#  minutes while the technician is still answering questions.
+#
+#  State goes into $script: flags rather than a return value - the summary
+#  section needs four separate pieces of it, and the prefix keeps that
+#  visible at every use rather than relying on scope luck.
+# ------------------------------------------------------------------
+
+$script:ToolsHaveRun  = $false
+$script:WinAuditOk    = $false
+$script:DiskInfoOk    = $false
+$script:WinAuditSaved = @()
+$script:DiskInfoDest  = $null
+
+function Invoke-AuditTools {
+    param([string]$Title = 'RUNNING APPLICATIONS AUDIT')
+
+    # Set before any work, not after: a tool that throws must not leave the
+    # main flow thinking it still has to run everything a second time.
+    $script:ToolsHaveRun = $true
+
+    # Reset, because the GUI button can run this more than once. Without it a
+    # second pass would append to $WinAuditSaved and push its count past the
+    # number of formats, turning a good run into a reported failure.
+    $script:WinAuditSaved = @()
+    $script:WinAuditOk    = $false
+    $script:DiskInfoOk    = $false
+
+    Write-Title $Title
+
+    # ---------------- WinAudit ----------------
+
+    # WinAudit resolves a RELATIVE /f= against its own folder rather than the
+    # working directory, but it handles an absolute path fine even when that
+    # path contains spaces. So point it straight at the machine folder - the
+    # report never passes through the root, and because the machine folder is
+    # created fresh for every run there is no stale output to guard against.
+    #
+    # One pass per format: WinAudit writes a single format per invocation, so
+    # two formats means collecting everything twice.
+    $winAuditLogs = @()
+
+    foreach ($fmt in $WinAuditFormats) {
+        $dest   = Join-Path $ExportDir "${Hostname}_winaudit.$fmt"
+        $fmtLog = Join-Path $ExportDir "winaudit_run_$fmt.log"
+        $winAuditLogs += $fmtLog
+
+        if ($WinAuditFormats.Count -gt 1) {
+            Write-Info "Running WinAudit ($fmt)... this can take a few minutes, please wait."
+        } else {
+            Write-Info 'Running WinAudit... this can take a few minutes, please wait.'
+        }
+
+        $winAuditArgs = @(
+            "/r=$WinAuditCategories"
+            "/f=$dest"
+            "/l=$fmtLog"
+            '/L=en'
+        )
+
+        if (-not (Invoke-Tool -FilePath $WinAuditExe -Arguments $winAuditArgs `
+                              -WorkingDirectory $AppsDir -TimeoutSec $WinAuditTimeoutSec `
+                              -Name "WinAudit ($fmt)")) {
+            continue
+        }
+
+        if (-not (Test-Path -LiteralPath $dest)) {
+            Write-Fail "WinAudit finished but produced no $fmt file."
+            Write-Log "WinAudit produced no $fmt output."
+            continue
+        }
+
+        # The .csv2 extension is only there to make WinAudit emit the labelled
+        # long format; what it writes is ordinary CSV. Rename it so it opens in
+        # Excel on a double click.
+        if ($fmt -eq 'csv2') {
+            $friendlyName = [IO.Path]::ChangeExtension($dest, 'csv')
+            Move-Item -LiteralPath $dest -Destination $friendlyName -Force
+            $dest = $friendlyName
+            Write-Log 'Renamed WinAudit output from .csv2 to .csv (same content).'
+        }
+
+        $kb = [math]::Round((Get-Item -LiteralPath $dest).Length / 1KB, 1)
+        Write-Ok "WinAudit report saved: $(Split-Path -Leaf $dest) ($kb KB)"
+        Write-Log "WinAudit report saved: $dest ($kb KB)"
+        $script:WinAuditSaved += $dest
+    }
+
+    # Only a clean sweep counts, so a missing second format still shows as a
+    # failure rather than passing quietly.
+    $script:WinAuditOk = $script:WinAuditSaved.Count -eq $WinAuditFormats.Count
+
+    # Fold WinAudit's own logs into audit.log if anything went wrong, then bin
+    # them so the machine folder keeps to the files that matter.
+    foreach ($fmtLog in $winAuditLogs) {
+        if (-not (Test-Path -LiteralPath $fmtLog)) { continue }
+
+        if (-not $script:WinAuditOk) {
+            Write-Log "--- $(Split-Path -Leaf $fmtLog) ---"
+            foreach ($line in (Get-Content -LiteralPath $fmtLog)) { Write-Log "    $line" }
+            Write-Log '--- end log ---'
+        }
+
+        # WinAudit can keep its log handle open for a moment after exiting, so
+        # retry briefly rather than leaving a stray file in the machine folder.
+        for ($attempt = 1; $attempt -le 10; $attempt++) {
+            Remove-Item -LiteralPath $fmtLog -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $fmtLog)) { break }
+            Start-Sleep -Milliseconds 300
+        }
+        if (Test-Path -LiteralPath $fmtLog) {
+            Write-Log "Could not delete $(Split-Path -Leaf $fmtLog) - file still locked."
+        }
+    }
+
+    Save-Log
+
+    # ---------------- CrystalDiskInfo ----------------
+
+    Write-Host ''
+    Write-Info 'Running CrystalDiskInfo...'
+
+    $script:DiskInfoDest = Join-Path $ExportDir "${Hostname}_diskinfo.txt"
+
+    # Delete any DiskInfo.txt left behind by an earlier run. Without this, a
+    # failed run on this machine would silently hand you the *previous*
+    # machine's SMART data filed under this hostname.
+    if (Test-Path -LiteralPath $DiskInfoTxtSrc) {
+        Remove-Item -LiteralPath $DiskInfoTxtSrc -Force -ErrorAction SilentlyContinue
+        Write-Log 'Removed a stale DiskInfo.txt before running CrystalDiskInfo.'
+    }
+
+    if (Invoke-Tool -FilePath $DiskInfoExe -Arguments @('/CopyExit') `
+                    -WorkingDirectory $AppsDir -TimeoutSec $DiskInfoTimeoutSec -Name 'CrystalDiskInfo') {
+
+        if (Test-Path -LiteralPath $DiskInfoTxtSrc) {
+            Move-Item -LiteralPath $DiskInfoTxtSrc -Destination $script:DiskInfoDest -Force
+            $script:DiskInfoOk = $true
+            Write-Ok 'Disk / SMART report saved'
+            Write-Log "Disk report saved: $script:DiskInfoDest"
+        } else {
+            Write-Fail 'CrystalDiskInfo finished but wrote no DiskInfo.txt.'
+            Write-Log 'CrystalDiskInfo produced no DiskInfo.txt.'
+        }
+    }
+
+    Save-Log
 }
 
 # ==================================================================
@@ -562,7 +1161,12 @@ Write-Info "Results folder: $OutDir"
 
 $answers = $null
 
-while ($true) {
+# The form is the default front end. -Console asks for the original prompts
+# outright, and Get-AnswersGui returns $null when no form can be shown, so
+# either way the interview below runs only when it is actually needed.
+if (-not $Console) { $answers = Get-AnswersGui }
+
+while ($null -eq $answers) {
 
     Write-Title 'PART 1 OF 2  -  QUESTIONS'
 
@@ -632,6 +1236,8 @@ while ($true) {
     Write-Host ''
     if (Read-YesNo 'Is all of the above correct?') { break }
 
+    # Throw the rejected set away so the loop condition sends us round again.
+    $answers = $null
     Write-Host ''
     Write-Warn 'Starting the questions again.'
 }
@@ -651,7 +1257,8 @@ $txt = New-Object System.Collections.ArrayList
 [void]$txt.Add('==============================================')
 [void]$txt.Add('')
 foreach ($key in $answers.Keys) {
-    [void]$txt.Add(('{0,-24}: {1}' -f $key, $answers[$key]))
+    Format-LabelledValue -Label $key -Value $answers[$key] -Pad 24 |
+        ForEach-Object { [void]$txt.Add($_) }
 }
 [void]$txt.Add('')
 
@@ -666,129 +1273,14 @@ Save-Log
 #  Automated tools
 # ==================================================================
 
-Write-Title 'PART 2 OF 2  -  RUNNING APPLICATIONS AUDIT'
-
-$winAuditOk = $false
-$diskInfoOk = $false
-
-# ---------------- WinAudit ----------------
-
-# WinAudit resolves a RELATIVE /f= against its own folder rather than the
-# working directory, but it handles an absolute path fine even when that
-# path contains spaces. So point it straight at the machine folder - the
-# report never passes through the root, and because the machine folder is
-# created fresh for every run there is no stale output to guard against.
-#
-# One pass per format: WinAudit writes a single format per invocation, so
-# two formats means collecting everything twice.
-$winAuditLogs  = @()
-$winAuditSaved = @()
-
-foreach ($fmt in $WinAuditFormats) {
-    $dest   = Join-Path $ExportDir "${Hostname}_winaudit.$fmt"
-    $fmtLog = Join-Path $ExportDir "winaudit_run_$fmt.log"
-    $winAuditLogs += $fmtLog
-
-    if ($WinAuditFormats.Count -gt 1) {
-        Write-Info "Running WinAudit ($fmt)... this can take a few minutes, please wait."
-    } else {
-        Write-Info 'Running WinAudit... this can take a few minutes, please wait.'
-    }
-
-    $winAuditArgs = @(
-        "/r=$WinAuditCategories"
-        "/f=$dest"
-        "/l=$fmtLog"
-        '/L=en'
-    )
-
-    if (-not (Invoke-Tool -FilePath $WinAuditExe -Arguments $winAuditArgs `
-                          -WorkingDirectory $AppsDir -TimeoutSec $WinAuditTimeoutSec `
-                          -Name "WinAudit ($fmt)")) {
-        continue
-    }
-
-    if (-not (Test-Path -LiteralPath $dest)) {
-        Write-Fail "WinAudit finished but produced no $fmt file."
-        Write-Log "WinAudit produced no $fmt output."
-        continue
-    }
-
-    # The .csv2 extension is only there to make WinAudit emit the labelled
-    # long format; what it writes is ordinary CSV. Rename it so it opens in
-    # Excel on a double click.
-    if ($fmt -eq 'csv2') {
-        $friendlyName = [IO.Path]::ChangeExtension($dest, 'csv')
-        Move-Item -LiteralPath $dest -Destination $friendlyName -Force
-        $dest = $friendlyName
-        Write-Log 'Renamed WinAudit output from .csv2 to .csv (same content).'
-    }
-
-    $kb = [math]::Round((Get-Item -LiteralPath $dest).Length / 1KB, 1)
-    Write-Ok "WinAudit report saved: $(Split-Path -Leaf $dest) ($kb KB)"
-    Write-Log "WinAudit report saved: $dest ($kb KB)"
-    $winAuditSaved += $dest
+# The GUI's "Run audit apps" button may already have done all of this while
+# the questions were being answered. Only run it here if it did not.
+if (-not $script:ToolsHaveRun) {
+    Invoke-AuditTools -Title 'PART 2 OF 2  -  RUNNING APPLICATIONS AUDIT'
+} else {
+    Write-Host ''
+    Write-Info 'Applications audit already completed from the questions window.'
 }
-
-# Only a clean sweep counts, so a missing second format still shows as a
-# failure rather than passing quietly.
-$winAuditOk = $winAuditSaved.Count -eq $WinAuditFormats.Count
-
-# Fold WinAudit's own logs into audit.log if anything went wrong, then bin
-# them so the machine folder keeps to the files that matter.
-foreach ($fmtLog in $winAuditLogs) {
-    if (-not (Test-Path -LiteralPath $fmtLog)) { continue }
-
-    if (-not $winAuditOk) {
-        Write-Log "--- $(Split-Path -Leaf $fmtLog) ---"
-        foreach ($line in (Get-Content -LiteralPath $fmtLog)) { Write-Log "    $line" }
-        Write-Log '--- end log ---'
-    }
-
-    # WinAudit can keep its log handle open for a moment after exiting, so
-    # retry briefly rather than leaving a stray file in the machine folder.
-    for ($attempt = 1; $attempt -le 10; $attempt++) {
-        Remove-Item -LiteralPath $fmtLog -Force -ErrorAction SilentlyContinue
-        if (-not (Test-Path -LiteralPath $fmtLog)) { break }
-        Start-Sleep -Milliseconds 300
-    }
-    if (Test-Path -LiteralPath $fmtLog) {
-        Write-Log "Could not delete $(Split-Path -Leaf $fmtLog) - file still locked."
-    }
-}
-
-Save-Log
-
-# ---------------- CrystalDiskInfo ----------------
-
-Write-Host ''
-Write-Info 'Running CrystalDiskInfo...'
-
-$diskInfoDest = Join-Path $ExportDir "${Hostname}_diskinfo.txt"
-
-# Delete any DiskInfo.txt left behind by an earlier run. Without this, a
-# failed run on this machine would silently hand you the *previous*
-# machine's SMART data filed under this hostname.
-if (Test-Path -LiteralPath $DiskInfoTxtSrc) {
-    Remove-Item -LiteralPath $DiskInfoTxtSrc -Force -ErrorAction SilentlyContinue
-    Write-Log 'Removed a stale DiskInfo.txt before running CrystalDiskInfo.'
-}
-
-if (Invoke-Tool -FilePath $DiskInfoExe -Arguments @('/CopyExit') `
-                -WorkingDirectory $AppsDir -TimeoutSec $DiskInfoTimeoutSec -Name 'CrystalDiskInfo') {
-
-    if (Test-Path -LiteralPath $DiskInfoTxtSrc) {
-        Move-Item -LiteralPath $DiskInfoTxtSrc -Destination $diskInfoDest -Force
-        $diskInfoOk = $true
-        Write-Ok 'Disk / SMART report saved'
-        Write-Log "Disk report saved: $diskInfoDest"
-    } else {
-        Write-Fail 'CrystalDiskInfo finished but wrote no DiskInfo.txt.'
-        Write-Log 'CrystalDiskInfo produced no DiskInfo.txt.'
-    }
-}
-
-Save-Log
 
 # ==================================================================
 #  REPORT_SUMMARY.txt
@@ -831,7 +1323,8 @@ Add-ReportHeading 'TECHNICIAN NOTES'
 $notePad = 22
 foreach ($key in $answers.Keys) { if ($key.Length -gt $notePad) { $notePad = $key.Length } }
 foreach ($key in $answers.Keys) {
-    Add-Report ('    {0} : {1}' -f $key.PadRight($notePad), $answers[$key])
+    Format-LabelledValue -Label $key -Value $answers[$key] -Pad $notePad `
+                         -Prefix '    ' -Separator ' : ' | ForEach-Object { Add-Report $_ }
 }
 
 Add-ReportHeading 'WINDOWS LICENCE'
@@ -853,7 +1346,7 @@ if ($licences) {
     Add-Report '    NOT AVAILABLE - could not read Windows licensing information.'
 }
 
-$rtfText = if ($winAuditOk) { Convert-RtfToText $winAuditSaved[0] } else { $null }
+$rtfText = if ($script:WinAuditOk) { Convert-RtfToText $script:WinAuditSaved[0] } else { $null }
 
 Add-ReportHeading 'SYSTEM OVERVIEW'
 $section = if ($rtfText) { Get-WinAuditSection -Lines $rtfText -Title 'System Overview' } else { $null }
@@ -874,7 +1367,7 @@ if ($section) {
 }
 
 Add-ReportHeading 'DISK HEALTH   (S.M.A.R.T. attribute tables omitted)'
-$section = if ($diskInfoOk) { Get-DiskInfoSummary $diskInfoDest } else { $null }
+$section = if ($script:DiskInfoOk) { Get-DiskInfoSummary $script:DiskInfoDest } else { $null }
 if ($section) {
     $section | ForEach-Object { Add-Report (('    ' + $_).TrimEnd()) }
 } else {
@@ -910,14 +1403,14 @@ Write-Host ''
 Write-Host '  Manual answers (.txt)         ' -NoNewline -ForegroundColor White
 Write-Host 'saved' -ForegroundColor Green
 Write-Host '  WinAudit report               ' -NoNewline -ForegroundColor White
-if ($winAuditOk) { Write-Host 'saved' -ForegroundColor Green } else { Write-Host 'FAILED' -ForegroundColor Red }
+if ($script:WinAuditOk) { Write-Host 'saved' -ForegroundColor Green } else { Write-Host 'FAILED' -ForegroundColor Red }
 Write-Host '  Disk / SMART report           ' -NoNewline -ForegroundColor White
-if ($diskInfoOk) { Write-Host 'saved' -ForegroundColor Green } else { Write-Host 'FAILED' -ForegroundColor Red }
+if ($script:DiskInfoOk) { Write-Host 'saved' -ForegroundColor Green } else { Write-Host 'FAILED' -ForegroundColor Red }
 Write-Host '  REPORT_SUMMARY.txt            ' -NoNewline -ForegroundColor White
 if ($summaryOk) { Write-Host 'saved' -ForegroundColor Green } else { Write-Host 'FAILED' -ForegroundColor Red }
 Write-Host ''
 
-if ($winAuditOk -and $diskInfoOk -and $summaryOk) {
+if ($script:WinAuditOk -and $script:DiskInfoOk -and $summaryOk) {
     $exitCode = 0
     Write-Ok 'Audit complete.'
 } else {

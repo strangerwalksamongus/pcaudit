@@ -31,12 +31,36 @@ if not exist "%PS_SCRIPT%" (
     exit /b 2
 )
 
+rem ------------------------------------------------------------------
+rem  Separate our own re-entry marker from arguments meant for the PS1.
+rem
+rem  --elevated is internal to THIS file. run_audit.ps1 has no parameter
+rem  by that name, so forwarding it would make PowerShell reject the call
+rem  before the script ran at all. Elevation is unaffected either way -
+rem  the elevated copy still runs the entire audit, exactly as before.
+rem
+rem  Everything else is passed straight through, so:
+rem      run_audit.bat -Console
+rem  elevates as usual and then asks the questions in the console rather
+rem  than on the form.
+rem ------------------------------------------------------------------
+set "PS_ARGS="
+set "WAS_ELEVATED="
+:parse_args
+if "%~1"=="" goto args_done
+if /i "%~1"=="--elevated" (set "WAS_ELEVATED=1") else (set "PS_ARGS=!PS_ARGS! %1")
+shift
+goto parse_args
+:args_done
+
 rem --- Are we elevated? "net session" only succeeds as administrator. ---
 net session >nul 2>&1
 if %ERRORLEVEL% equ 0 goto :run_audit
 
-rem --- Already tried to elevate once and still not admin: give up. ---
-if "%~1"=="--elevated" (
+rem --- Already tried to elevate once and still not admin: give up.
+rem     Tested through the variable, not %1 - shift has consumed the
+rem     arguments by this point. ---
+if defined WAS_ELEVATED (
     echo.
     echo   ERROR: Administrator rights are required, but this process is
     echo          still not elevated.
@@ -53,7 +77,7 @@ echo   Requesting administrator rights...
 echo   (WinAudit and CrystalDiskInfo need them for complete data.)
 echo.
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { Start-Process -FilePath '%~f0' -ArgumentList '--elevated' -Verb RunAs -ErrorAction Stop; exit 0 } catch { exit 1 }"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { Start-Process -FilePath '%~f0' -ArgumentList '--elevated%PS_ARGS%' -Verb RunAs -ErrorAction Stop; exit 0 } catch { exit 1 }"
 
 if %ERRORLEVEL% neq 0 (
     echo.
@@ -68,6 +92,6 @@ rem The elevated copy is doing the work now; this one is done.
 exit /b 0
 
 :run_audit
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%"%PS_ARGS%
 set "RC=%ERRORLEVEL%"
 exit /b %RC%
