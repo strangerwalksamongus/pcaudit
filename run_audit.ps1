@@ -268,6 +268,75 @@ function Invoke-SpeedTest {
 }
 
 # ------------------------------------------------------------------
+#  Network details
+#
+#  Interface, IPv4 address and netmask for the report's NETWORK section.
+#
+#  Only adapters holding a default route are reported. A typical workstation
+#  also has Hyper-V switches, WSL and leftover VPN adapters, all with
+#  perfectly valid addresses and none of them worth reading - having a
+#  default route is what separates "on the network" from noise. If nothing
+#  has one, fall back to whatever real addresses exist so an isolated
+#  machine still reports something.
+#
+#  Returns $null when there is nothing to show, so the report prints a
+#  visible NOT AVAILABLE like the other sections.
+# ------------------------------------------------------------------
+
+function ConvertTo-IPv4Mask {
+    param([int]$PrefixLength)
+    $bits   = ('1' * $PrefixLength) + ('0' * (32 - $PrefixLength))
+    $octets = for ($i = 0; $i -lt 32; $i += 8) { [Convert]::ToInt32($bits.Substring($i, 8), 2) }
+    return ($octets -join '.')
+}
+
+function Get-LocalNetwork {
+    try {
+        # 127.x is loopback and 169.254.x is what Windows invents when DHCP
+        # fails - neither says anything about the network the machine is on.
+        $addresses = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+                       Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' })
+    } catch {
+        Write-Log "Network: could not read IPv4 addresses - $($_.Exception.Message)"
+        return $null
+    }
+    if (-not $addresses.Count) {
+        Write-Log 'Network: no usable IPv4 address found.'
+        return $null
+    }
+
+    # Interface indexes that own a default route, best metric first.
+    $gwOrder = @()
+    try {
+        $gwOrder = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+                     Sort-Object RouteMetric |
+                     Select-Object -ExpandProperty InterfaceIndex -Unique)
+    } catch {
+        Write-Log "Network: could not read routes - $($_.Exception.Message)"
+    }
+
+    $useful = @($addresses | Where-Object { $gwOrder -contains $_.InterfaceIndex })
+    if (-not $useful.Count) {
+        Write-Log 'Network: no adapter has a default route, listing all real addresses instead.'
+        $useful = $addresses
+    } else {
+        $useful = @($useful | Sort-Object { [array]::IndexOf($gwOrder, $_.InterfaceIndex) })
+    }
+
+    $out = New-Object System.Collections.ArrayList
+    foreach ($a in $useful) {
+        $mask = ConvertTo-IPv4Mask $a.PrefixLength
+        [void]$out.Add([pscustomobject]@{
+            Interface = $a.InterfaceAlias
+            IP        = $a.IPAddress
+            Mask      = $mask
+        })
+        Write-Log ('Network: {0} / {1} on {2}' -f $a.IPAddress, $mask, $a.InterfaceAlias)
+    }
+    return $out
+}
+
+# ------------------------------------------------------------------
 #  GUI front end
 #
 #  Same ten questions as the console flow, on one form, with a proper
@@ -666,7 +735,6 @@ function Get-AnswersGui {
         'Windows sticker'      = (& $yn 'sticker')
         'Email space'          = $txtMailbox.Text.Trim()
         'Technical issues'     = $issues
-        'Audited by'           = $identity.Name
         'Audit date'           = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     }
 
@@ -1231,7 +1299,6 @@ while ($null -eq $answers) {
         'Windows sticker'      = (& $yn $hasSticker)
         'Email space'          = $mailbox
         'Technical issues'     = $issues
-        'Audited by'           = $identity.Name
         'Audit date'           = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     }
 
@@ -1331,6 +1398,22 @@ foreach ($key in $answers.Keys) { if ($key.Length -gt $notePad) { $notePad = $ke
 foreach ($key in $answers.Keys) {
     Format-LabelledValue -Label $key -Value $answers[$key] -Pad $notePad `
                          -Prefix '    ' -Separator ' : ' | ForEach-Object { Add-Report $_ }
+}
+
+Add-ReportHeading 'NETWORK'
+$nics = Get-LocalNetwork
+if ($nics) {
+    $firstNic = $true
+    foreach ($nic in $nics) {
+        if (-not $firstNic) { Add-Report }
+        $firstNic = $false
+        Add-Report ('    {0} : {1}' -f 'Interface'.PadRight(22),   $nic.Interface)
+        Add-Report ('    {0} : {1}' -f 'IP address'.PadRight(22),  $nic.IP)
+        Add-Report ('    {0} : {1}' -f 'Subnet mask'.PadRight(22), $nic.Mask)
+    }
+} else {
+    Add-Report '    NOT AVAILABLE - could not read the network configuration.'
+    Write-Log 'Summary: network details not available.'
 }
 
 Add-ReportHeading 'WINDOWS LICENCE'
