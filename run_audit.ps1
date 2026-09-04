@@ -19,9 +19,8 @@
 #>
 
 param(
-    # Ask the ten questions in the console instead of on a form, exactly as
-    # earlier versions did. The script also falls back to this on its own if
-    # no form can be shown (no desktop session, or a non-STA host).
+    # Use the console questions instead of the form. Also kicks in on its own
+    # if no form can be shown.
     [switch]$Console
 )
 
@@ -32,44 +31,35 @@ $ErrorActionPreference = 'Stop'
 #  Configuration
 # ------------------------------------------------------------------
 
-# Categories to collect. Letters are CASE SENSITIVE and several are
-# composite - one letter can emit more than one category.
+# Categories to collect. Case sensitive, and some letters pull in more than
+# one category.
 #
 #   specs    g System Overview   o Operating System  p Processors (+Cache)
 #            m Memory            M Memory Device     b BIOS (+Board/Chassis)
 #            i Physical Disks    d Drives            a Display Adapters
 #            D Display Caps      P Peripherals (+Ports/Slots)
-#   software s Installed Programs (also brings Software Updates + Active Setup)
+#   software s Installed Programs (+Software Updates, Active Setup)
 #   system   u Users (+Groups)   N Network Shares    U Uptime Statistics
 #
-# Deliberately NOT collected: z (Hardware Devices) is per-device driver
-# inventory - 255 devices x 12 fields, ~3060 rows and 200 KB on its own,
-# which was more than half the file. Add a z here if you ever need driver
-# versions.
+# Leaving out z (Hardware Devices) - it's ~3000 rows of per-device driver
+# info, more than half the file on its own. Add it if you need driver versions.
 #
-# The full set 'gsoPxuTUeERNtnzDaIbMpmidcSArCOHG' takes ~5.5 minutes; this
-# one takes ~20 seconds.
+# This set takes ~20 seconds. The full set is nearer 5.5 minutes.
 $WinAuditCategories = 'gopmMbidaDPsuNU'
 
-# WinAudit picks its output format from the file extension. List every
-# format you want; note it can only write ONE per invocation, so each extra
-# format costs another full pass (~30 seconds each).
-#   csv2 - one row per field, WITH a header row and a CategoryName column,
-#          so every value is labelled and the file can be filtered.
-#          Renamed to .csv afterwards so it opens on a double click - the
-#          content is ordinary CSV, only the extension picks the format.
-#   rtf  - readable document, a table per category, opens in WordPad.
-#          Nice to read, but you cannot sort or filter it.
-#   csv  - AVOID: no header row at all, just unlabelled positional values
-#   html - AVOID: in command line mode WinAudit writes HTML as frames,
-#          which produces several files instead of one.
+# WinAudit picks the format from the file extension and only writes one per
+# run, so each extra format is another full pass (~30s).
+#   csv2 - labelled CSV with headers. Renamed to .csv after; same content.
+#   rtf  - readable, one table per category, but you can't sort or filter it.
+#   csv  - avoid, no headers, just bare values.
+#   html - avoid, writes frames so you get several files instead of one.
 $WinAuditFormats = @('rtf')
 
-$WinAuditTimeoutSec = 900   # 15 min; a full audit can genuinely take minutes
+$WinAuditTimeoutSec = 900   # 15 min - a full audit really can take that long
 $DiskInfoTimeoutSec = 180   # 3 min
 
-# Internet speed test, run by librespeed-cli. The raw JSON is kept per
-# machine next to the other reports.
+# Speed test, run by librespeed-cli. The raw JSON is kept with the other
+# reports for that machine.
 $SpeedTestServer     = 106   # Belgrade, Serbia (SOX)
 $SpeedTestConcurrent = 8
 $SpeedTestTimeoutSec = 180   # a healthy link finishes in about 35 seconds
@@ -83,26 +73,24 @@ if (-not $ScriptDir) {
     $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 }
 
-# Every bundled tool lives under apps\, which is what keeps the root of the
-# stick down to the two scripts plus RESULTS\. Tools are only ever addressed
-# through $AppsDir; the root holds nothing any of them needs.
+# All the tools live in apps\, which keeps the root down to the scripts and
+# RESULTS\. Nothing any of them needs is in the root.
 $AppsDir = Join-Path $ScriptDir 'apps'
 
 $WinAuditExe = Join-Path $AppsDir 'WinAudit.exe'
 $DiskInfoExe = Join-Path $AppsDir 'DiskInfo64.exe'
 
-# librespeed-cli keeps its own folder inside apps\.
+# librespeed-cli has its own folder in apps\.
 $LibreSpeedExe = Join-Path $AppsDir 'librespeed\librespeed-cli.exe'
 
-# CrystalDiskInfo 9.x is NOT a single-file portable app. Without these
-# folders beside the executable it aborts looking for
-# CdiResource\dialog\Graph.html and silently writes no report - so they
-# belong in apps\ alongside DiskInfo64.exe, never split away from it.
+# CrystalDiskInfo 9.x isn't a single-file portable app. Without these next to
+# the exe it dies looking for CdiResource\dialog\Graph.html and writes nothing,
+# so they have to stay with DiskInfo64.exe.
 $CdiResourceDir = Join-Path $AppsDir 'CdiResource'
 $CdiSmartDir    = Join-Path $AppsDir 'Smart'
 
-# CrystalDiskInfo ignores where you ask it to write and always drops this
-# next to its own executable - which is apps\ now, not the root.
+# CDI ignores whatever output path you give it and always writes next to its
+# own exe - so apps\ now, not the root.
 $DiskInfoTxtSrc = Join-Path $AppsDir 'DiskInfo.txt'
 
 $Hostname = $env:COMPUTERNAME
@@ -125,13 +113,11 @@ function Write-Fail { param([string]$Text) Write-Host "  [FAIL]   $Text" -Foregr
 function Write-Warn { param([string]$Text) Write-Host "  [WARN]   $Text" -ForegroundColor Yellow }
 function Write-Info { param([string]$Text) Write-Host "  $Text" -ForegroundColor Gray }
 
-# The console only gets in the way while the form is up - the form carries its
-# own progress, and a console in front of it invites clicking the wrong window.
-# Minimised rather than hidden, so it can still be brought back by hand, and
-# so it is already on the taskbar when we restore it afterwards.
+# The console just gets in the way while the form is up. Minimised rather than
+# hidden so it can still be clicked back if needed.
 #
-# The P/Invoke type is compiled on first use rather than at startup: console
-# mode never calls this, and there is no reason to make it pay for the compile.
+# Type is compiled on first use - console mode never calls this and shouldn't
+# pay for the compile.
 function Set-ConsoleWindowState {
     param([ValidateSet('Minimised', 'Restored')][string]$State)
     try {
@@ -146,28 +132,24 @@ function Set-ConsoleWindowState {
         # 6 = SW_MINIMIZE, 9 = SW_RESTORE
         [void][AuditNative.ConsoleWindow]::ShowWindow($hwnd, $(if ($State -eq 'Minimised') { 6 } else { 9 }))
     } catch {
-        # Purely cosmetic; never let a window-state call take down the audit.
+        # Cosmetic only - don't let this take down the audit.
         Write-Log "Console window could not be set to $State - $($_.Exception.Message)"
     }
 }
 
-# Log lines are collected in memory and flushed to audit.log at the end,
-# and also flushed after each tool runs so a yanked stick still leaves
-# something behind.
+# Log lines are kept in memory and flushed to audit.log at the end, and after
+# each tool, so a yanked stick still leaves something behind.
 $script:LogLines = New-Object System.Collections.ArrayList
-# Deliberately distinctive: PowerShell variable names are case-insensitive,
-# so a plain $LogPath here would collide with any local $logPath elsewhere in
-# the script and silently redirect the audit trail to the wrong file.
+# Odd name on purpose - variable names are case-insensitive, so a plain
+# $LogPath would collide with any local $logPath and send the log elsewhere.
 $script:AuditLogPath = $null
 
-# Set only while the GUI is waiting on a tool, so Invoke-Tool's poll loop can
-# keep the form repainting instead of letting Windows grey it out as "Not
-# Responding". Stays false in console mode, where there is nothing to pump.
+# True only while the GUI is waiting on a tool, so Invoke-Tool's poll loop
+# keeps the form repainting instead of going "Not Responding".
 $script:PumpUiEvents = $false
 
-# Where Invoke-Tool writes its elapsed counter while the GUI is up. The
-# console is minimised behind the form by then, so without this the operator
-# has nowhere to see that a tool is still working.
+# Where Invoke-Tool puts its elapsed counter while the GUI is up. The console
+# is minimised by then, so this is the only place progress shows.
 $script:UiStatusLabel = $null
 
 function Write-Log {
@@ -178,9 +160,8 @@ function Write-Log {
 
 function Save-Log {
     if (-not $script:AuditLogPath) { return }
-    # A sync client (OneDrive) or antivirus can hold the file open for a
-    # moment, and a single silent failure here loses the rest of the log with
-    # nothing to show why. Retry, but never let logging take down the run.
+    # OneDrive or antivirus can hold the file open for a moment, and one silent
+    # failure here loses the rest of the log. Retry, but never throw.
     for ($attempt = 1; $attempt -le 5; $attempt++) {
         try {
             Set-Content -LiteralPath $script:AuditLogPath -Value $script:LogLines -Encoding UTF8 -ErrorAction Stop
@@ -205,9 +186,8 @@ function Read-NonEmpty {
     }
 }
 
-# Free text that may legitimately be left blank. Plenty of machines have
-# nothing worth noting, and forcing the operator to type "none" just invites
-# junk answers, so an empty reply records a clear default instead.
+# Free text that's allowed to be blank. Making someone type "none" every time
+# just invites junk answers, so blank records a sensible default instead.
 function Read-Optional {
     param(
         [string]$Prompt,
@@ -219,9 +199,8 @@ function Read-Optional {
     return $Default
 }
 
-# Anything that isn't a clear yes or no is rejected and re-asked. Treating
-# unrecognised input as "no" is how audits end up quietly recording that a
-# machine has no antivirus when the tech just fat-fingered a key.
+# Reject anything that isn't clearly yes or no and ask again. Treating a typo
+# as "no" is how you end up recording that a machine has no antivirus.
 function Read-YesNo {
     param([string]$Prompt)
     while ($true) {
@@ -237,20 +216,17 @@ function Read-YesNo {
     }
 }
 
-# Offers to run a speed test on a given medium. If accepted, runs
-# librespeed-cli and keeps its raw JSON in the machine folder, then reads the
+# Offers a speed test, runs librespeed-cli, keeps the raw JSON and reads the
 # figures back out of it.
 #
-# Always returns two values so the report is never blank: measured speeds on
-# success, 'Not tested' if declined, 'Test failed' if the tool errored or
-# wrote something unreadable. A failed speed test must not stop the audit.
+# Always returns two values so the report is never blank - the speeds, or
+# 'Not tested' / 'Test failed'. A failed test must not stop the audit.
 function Invoke-SpeedTest {
     param(
         [string]$Number,
         [string]$Medium,
         [string]$JsonPath,
-        # The GUI has its own button for this, so it asks for the test
-        # directly rather than through a console Y/N prompt.
+        # The GUI has its own button, so it skips the console Y/N prompt.
         [switch]$NoPrompt
     )
 
@@ -270,8 +246,8 @@ function Invoke-SpeedTest {
 
     if (-not $ok) { return @('Test failed', 'Test failed') }
 
-    # librespeed-cli wraps its result in a single-element array, so index
-    # into it rather than reading properties off the array itself.
+    # librespeed-cli wraps the result in a single-element array, so index into
+    # it rather than reading properties off the array.
     try {
         $raw    = Get-Content -LiteralPath $JsonPath -Raw -ErrorAction Stop
         $result = @($raw | ConvertFrom-Json)[0]
@@ -294,23 +270,22 @@ function Invoke-SpeedTest {
 # ------------------------------------------------------------------
 #  GUI front end
 #
-#  The same ten questions as the console flow, on one form, with a real
-#  multi-line box for the technical issues. Builds and returns the usual
-#  $answers hashtable, so nothing downstream needs to know which front end
-#  was used.
+#  Same ten questions as the console flow, on one form, with a proper
+#  multi-line box for the technical issues. Returns the same $answers
+#  hashtable, so nothing downstream cares which front end was used.
 #
-#  Returns $null when a form cannot be shown; the caller then falls through
-#  to the console interview rather than failing.
+#  Returns $null if no form can be shown - the caller falls back to the
+#  console questions.
 #
-#  There is no confirm-and-repeat loop here on purpose: every answer stays
-#  visible and editable until OK is pressed, so the form is its own review
-#  step, and fixing a typo no longer costs a repeat of both speed tests.
+#  No confirm-and-repeat loop here: everything stays editable until you press
+#  Save, so the form is its own review step and fixing a typo doesn't mean
+#  running both speed tests again.
 # ------------------------------------------------------------------
 
 function Get-AnswersGui {
 
-    # A form needs an STA thread. powershell.exe gives us one, but pwsh.exe
-    # defaults to MTA, so measure it rather than assume.
+    # Forms need an STA thread. powershell.exe gives us one, pwsh.exe doesn't,
+    # so check rather than assume.
     if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
         Write-Log 'GUI: thread is not STA, using the console questions instead.'
         return $null
@@ -325,9 +300,9 @@ function Get-AnswersGui {
         return $null
     }
 
-    # Kept in a hashtable rather than two plain variables. A button handler
-    # runs in its own scope, so assigning to a variable there would never
-    # reach us; writing into a hashtable mutates the one object we share.
+    # Hashtable rather than two variables: button handlers run in their own
+    # scope, so an assignment there wouldn't reach us, but writing into a
+    # hashtable mutates the object we both hold.
     $speeds = @{
         wifi  = @('Not tested', 'Not tested')
         cable = @('Not tested', 'Not tested')
@@ -343,7 +318,7 @@ function Get-AnswersGui {
     $form.Font            = New-Object System.Drawing.Font('Segoe UI', 9)
     $form.Tag             = ''
 
-    # --- small builders, so the layout below stays readable ---
+    # --- builders, to keep the layout below readable ---
 
     function New-QLabel {
         param([string]$Text, [int]$Y, [int]$Width = 630)
@@ -362,10 +337,9 @@ function Get-AnswersGui {
         return $t
     }
 
-    # Each Yes/No pair needs its own container: radio buttons group by
-    # parent, so four pairs on the bare form would behave as one group of
-    # eight. Both start unchecked - the console flow refuses to treat a
-    # non-answer as "No", and the form must not be laxer than it was.
+    # Each Yes/No pair needs its own panel - radios group by parent, so four
+    # pairs on the bare form would act as one group of eight. Both start
+    # unchecked, same as the console flow refusing to default a blank to "No".
     $radios = @{}
     function New-YesNo {
         param([string]$Key, [int]$Y)
@@ -399,9 +373,8 @@ function Get-AnswersGui {
     $txtLogin    = New-QText 116
     $txtMailbox  = New-QText 470
 
-    # The applications audit sits above the speed tests so it can be started
-    # first: WinAudit and CrystalDiskInfo then work through their few minutes
-    # while the rest of the form is still being filled in.
+    # Sits above the speed tests so it gets started first - WinAudit and CDI
+    # then run while the rest of the form is being filled in.
     $btnAudit = New-Object System.Windows.Forms.Button
     $btnAudit.Text     = 'Run audit apps'
     $btnAudit.Location = New-Object System.Drawing.Point(14, 170)
@@ -474,16 +447,13 @@ function Get-AnswersGui {
 
     # --- long-running buttons ---
     #
-    # All of this runs inline on the UI thread. Invoke-Tool polls rather than
-    # blocks, and $script:PumpUiEvents makes that poll loop pump the message
-    # queue, so the window keeps repainting through the minutes a tool can
-    # take. $script:UiStatusLabel gives the loop somewhere on the form to put
-    # its elapsed counter, which matters because the console is minimised
-    # behind us and is no longer somewhere the operator can watch.
+    # These run inline on the UI thread. Invoke-Tool polls instead of blocking,
+    # and $script:PumpUiEvents makes that loop pump messages, so the window
+    # keeps repainting. $script:UiStatusLabel is where it writes the elapsed
+    # counter, since the console is minimised and can't show it.
     #
-    # Every button is disabled for the duration. Two tools competing for the
-    # same DiskInfo.txt, or an OK press landing mid-run, are not worth the
-    # convenience of leaving them live.
+    # Everything is disabled while one runs - not worth letting two tools fight
+    # over DiskInfo.txt or an OK press land mid-run.
 
     function Set-GuiBusy {
         param([bool]$Busy)
@@ -500,9 +470,8 @@ function Get-AnswersGui {
         $Label.ForeColor = [System.Drawing.Color]::DimGray
         $Label.Text      = 'Starting...'
 
-        # Nothing a tool does may be allowed to tear down the form: at this
-        # point the operator's typed answers exist only in these text boxes,
-        # and letting an exception escape would throw them away.
+        # Don't let a tool take the form down with it - the typed answers only
+        # exist in these text boxes right now.
         $res = @('Test failed', 'Test failed')
 
         $script:UiStatusLabel = $Label
@@ -539,9 +508,8 @@ function Get-AnswersGui {
         try {
             Invoke-AuditTools
         } catch {
-            # Same reasoning as the speed test: the answers are still only in
-            # the form. Record the failure, show it, and let the operator carry
-            # on - the main flow reports it again at the end from the same flags.
+            # Same as above - the answers are still only in the form. Log it,
+            # show it, carry on. The end-of-run summary reports it again.
             Write-Log "Applications audit threw - $($_.Exception.Message)"
         } finally {
             $script:PumpUiEvents  = $false
@@ -609,9 +577,9 @@ function Get-AnswersGui {
 
     Write-Info 'Answer the questions in the window that just opened.'
 
-    # Out of the way while the form has the screen. The finally guarantees it
-    # comes back even if something in the dialog throws - leaving the operator
-    # with a minimised console and no window would look like a crash.
+    # Out of the way while the form is up. The finally makes sure it comes back
+    # even if the dialog throws - a minimised console and no window looks like
+    # a crash.
     Set-ConsoleWindowState -State 'Minimised'
     try {
         [void]$form.ShowDialog()
@@ -619,9 +587,8 @@ function Get-AnswersGui {
         Set-ConsoleWindowState -State 'Restored'
     }
 
-    # Closing with the X behaves like Cancel. Falling back to the console
-    # after someone deliberately closed the window would just be ignoring
-    # them, so this ends the run instead.
+    # X behaves like Cancel. Dropping to the console questions after someone
+    # deliberately closed the window would just be ignoring them.
     if ([string]$form.Tag -ne 'ok') {
         $form.Dispose()
         Write-Log 'GUI: cancelled by the operator, nothing was written.'
@@ -663,9 +630,9 @@ function Get-AnswersGui {
 # ------------------------------------------------------------------
 #  External tool runner
 #
-#  Returns $true only if the process exited on its own within the
-#  timeout. A hung WinAudit (which happens if it decides to show its GUI)
-#  gets killed rather than blocking the audit forever.
+#  Returns $true only if the process exited on its own inside the timeout.
+#  A hung WinAudit (happens if it decides to show its GUI) gets killed
+#  rather than blocking the audit forever.
 # ------------------------------------------------------------------
 
 function Invoke-Tool {
@@ -687,8 +654,8 @@ function Invoke-Tool {
         WindowStyle      = 'Hidden'
         PassThru         = $true
     }
-    # librespeed-cli prints its JSON to stdout, so capture it straight to
-    # file rather than trying to read it back from a hidden process.
+    # librespeed-cli prints its JSON to stdout, so send it straight to a file
+    # rather than trying to read it back out of a hidden process.
     if ($StdOutFile) { $spArgs['RedirectStandardOutput'] = $StdOutFile }
 
     try {
@@ -699,9 +666,9 @@ function Invoke-Tool {
         return $false
     }
 
-    # Poll rather than block, so the operator gets a ticking counter. These
-    # tools print nothing for minutes at a time and use almost no CPU, so
-    # without this the screen looks frozen and people kill the audit.
+    # Poll instead of blocking so there's a ticking counter. These tools print
+    # nothing for minutes and barely touch the CPU, so without it the screen
+    # looks frozen and people kill the audit.
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while (-not $proc.HasExited) {
         if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) {
@@ -727,9 +694,9 @@ function Invoke-Tool {
     $code = try { $proc.ExitCode } catch { $null }
 
     if ($null -eq $code) {
-        # Start-Process does not surface ExitCode when stdout is redirected.
-        # Nothing is wrong; callers that capture output judge success from
-        # the output file itself, which is the stronger check anyway.
+        # Start-Process doesn't surface ExitCode when stdout is redirected.
+        # Not a problem - callers that capture output judge success from the
+        # file itself, which is the better check anyway.
         Write-Log "$Name : exited (no exit code available while capturing output)"
     } else {
         Write-Log "$Name : exited with code $code"
@@ -740,14 +707,14 @@ function Invoke-Tool {
 # ------------------------------------------------------------------
 #  Summary report helpers
 #
-#  These read back the exports to build REPORT_SUMMARY.txt. Each one
-#  returns $null rather than throwing when it cannot find what it wants,
-#  so a layout change in either tool shows up as a visible
-#  "NOT AVAILABLE" block instead of a silently empty report.
+#  These read the exports back to build REPORT_SUMMARY.txt. They return $null
+#  instead of throwing when they can't find what they want, so if either tool
+#  changes its layout you get a visible "NOT AVAILABLE" block rather than a
+#  quietly empty report.
 # ------------------------------------------------------------------
 
-# WinAudit's RTF is markup, not text. Letting a RichTextBox render it is
-# far more reliable than trying to strip the control words by hand.
+# WinAudit's RTF is markup, not text. Letting a RichTextBox render it beats
+# stripping the control words by hand.
 function Convert-RtfToText {
     param([string]$Path)
     try {
@@ -762,8 +729,8 @@ function Convert-RtfToText {
 }
 
 # Pulls one numbered section out of the rendered report. Drives is a parent
-# heading whose volumes are each their own numbered sub-section titled with
-# just the drive letter, so those get folded in when asked for.
+# heading and each volume is its own numbered sub-section titled with just the
+# drive letter, so those get folded back in when asked for.
 function Get-WinAuditSection {
     param(
         [string[]] $Lines,
@@ -802,12 +769,12 @@ function Format-AuditPairs {
 
         if ($t -notmatch "`t") {
             if ($t -match '^\s') {
-                # An injected sub-heading; give it breathing room.
+                # An injected sub-heading - give it some room.
                 if ($out.Count) { [void]$out.Add('') }
                 [void]$out.Add($t)
             } else {
-                # A field WinAudit left empty renders as a bare label with
-                # no tab. Keep it in column so the block stays aligned.
+                # An empty field renders as a bare label with no tab. Keep it
+                # in column so the block stays lined up.
                 [void]$out.Add(('    {0} :' -f $t.Trim().PadRight(22)))
             }
             continue
@@ -819,10 +786,9 @@ function Format-AuditPairs {
     return $out
 }
 
-# Question 10 can arrive as several lines now that the GUI gives it a
-# multi-line box. Put the first line against the label and indent the rest
-# underneath, so a multi-line answer cannot knock the two-column layout out
-# of true. Single-line values come out byte-identical to the old formatting.
+# Question 10 can come back as several lines now the GUI has a multi-line box.
+# First line goes against the label, the rest indent underneath so the two
+# columns stay lined up. Single-line values format exactly as they used to.
 function Format-LabelledValue {
     param(
         [string]$Label,
@@ -842,10 +808,10 @@ function Format-LabelledValue {
     return $out
 }
 
-# Windows licence channel and partial key. None of this appears in any of
-# the tool exports - WinAudit only reports the Product ID, which is an
-# install identifier and says nothing about how the machine is licensed.
-# Returns $null on failure so the report shows a visible NOT AVAILABLE.
+# Licence channel and partial key. None of this is in the tool exports -
+# WinAudit only gives the Product ID, which is an install identifier and says
+# nothing about how the machine is licensed. Returns $null on failure so the
+# report shows NOT AVAILABLE.
 function Get-WindowsLicence {
     try {
         $rows = @(Get-CimInstance -ClassName SoftwareLicensingProduct `
@@ -876,9 +842,9 @@ function Get-LicenceStatusText {
     }
 }
 
-# Everything CrystalDiskInfo reports except the S.M.A.R.T. attribute
-# tables. Written as skip-and-resume rather than "stop at the first
-# S.M.A.R.T." so a machine with several disks keeps every drive's details.
+# Everything CDI reports except the S.M.A.R.T. attribute tables. Skip-and-
+# resume rather than stopping at the first S.M.A.R.T., so a machine with
+# several disks keeps the details for all of them.
 function Get-DiskInfoSummary {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
@@ -890,7 +856,7 @@ function Get-DiskInfoSummary {
             $keep = $false
             continue
         }
-        # A "(02) Model" line means the next disk's details begin here.
+        # A "(02) Model" line means the next disk starts here.
         if (-not $keep -and $line -match '^\s*\(\d+\)\s+\S') {
             $keep = $true
             [void]$out.Add('')
@@ -903,15 +869,13 @@ function Get-DiskInfoSummary {
 # ------------------------------------------------------------------
 #  Applications audit
 #
-#  WinAudit and CrystalDiskInfo, plus all the post-processing that goes
-#  with them. This lives in a function so both front ends can drive it:
-#  the console flow calls it in sequence as it always did, while the GUI
-#  runs it from its own button, letting the tools work through their few
-#  minutes while the technician is still answering questions.
+#  WinAudit and CrystalDiskInfo plus the post-processing. In a function so
+#  both front ends can call it - the console flow runs it in sequence like
+#  always, the GUI runs it from a button so the tools work while the
+#  questions are still being answered.
 #
-#  State goes into $script: flags rather than a return value - the summary
-#  section needs four separate pieces of it, and the prefix keeps that
-#  visible at every use rather than relying on scope luck.
+#  Results go into $script: flags rather than a return value; the summary
+#  needs four separate pieces of state and the prefix keeps that obvious.
 # ------------------------------------------------------------------
 
 $script:ToolsHaveRun  = $false
@@ -923,13 +887,13 @@ $script:DiskInfoDest  = $null
 function Invoke-AuditTools {
     param([string]$Title = 'RUNNING APPLICATIONS AUDIT')
 
-    # Set before any work, not after: a tool that throws must not leave the
-    # main flow thinking it still has to run everything a second time.
+    # Set before the work, not after - if a tool throws, the main flow must not
+    # think it still has to run everything again.
     $script:ToolsHaveRun = $true
 
-    # Reset, because the GUI button can run this more than once. Without it a
-    # second pass would append to $WinAuditSaved and push its count past the
-    # number of formats, turning a good run into a reported failure.
+    # Reset, since the GUI button can run this more than once. Otherwise a
+    # second pass appends to $WinAuditSaved, pushes the count past the number
+    # of formats, and a good run gets reported as a failure.
     $script:WinAuditSaved = @()
     $script:WinAuditOk    = $false
     $script:DiskInfoOk    = $false
@@ -938,14 +902,12 @@ function Invoke-AuditTools {
 
     # ---------------- WinAudit ----------------
 
-    # WinAudit resolves a RELATIVE /f= against its own folder rather than the
-    # working directory, but it handles an absolute path fine even when that
-    # path contains spaces. So point it straight at the machine folder - the
-    # report never passes through the root, and because the machine folder is
-    # created fresh for every run there is no stale output to guard against.
+    # WinAudit resolves a relative /f= against its own folder, not the working
+    # directory, but absolute paths work fine even with spaces in them - so
+    # point it straight at the machine folder. That folder is new every run, so
+    # there's no stale output to worry about.
     #
-    # One pass per format: WinAudit writes a single format per invocation, so
-    # two formats means collecting everything twice.
+    # One pass per format, since WinAudit only writes one per run.
     $winAuditLogs = @()
 
     foreach ($fmt in $WinAuditFormats) {
@@ -978,8 +940,8 @@ function Invoke-AuditTools {
             continue
         }
 
-        # The .csv2 extension is only there to make WinAudit emit the labelled
-        # long format; what it writes is ordinary CSV. Rename it so it opens in
+        # The .csv2 extension only exists to make WinAudit emit the labelled
+        # format - what it writes is ordinary CSV. Rename it so it opens in
         # Excel on a double click.
         if ($fmt -eq 'csv2') {
             $friendlyName = [IO.Path]::ChangeExtension($dest, 'csv')
@@ -994,12 +956,12 @@ function Invoke-AuditTools {
         $script:WinAuditSaved += $dest
     }
 
-    # Only a clean sweep counts, so a missing second format still shows as a
-    # failure rather than passing quietly.
+    # Only a clean sweep counts - a missing second format should show as a
+    # failure, not pass quietly.
     $script:WinAuditOk = $script:WinAuditSaved.Count -eq $WinAuditFormats.Count
 
-    # Fold WinAudit's own logs into audit.log if anything went wrong, then bin
-    # them so the machine folder keeps to the files that matter.
+    # Fold WinAudit's own logs into audit.log if something went wrong, then
+    # delete them so the machine folder only keeps what matters.
     foreach ($fmtLog in $winAuditLogs) {
         if (-not (Test-Path -LiteralPath $fmtLog)) { continue }
 
@@ -1009,8 +971,8 @@ function Invoke-AuditTools {
             Write-Log '--- end log ---'
         }
 
-        # WinAudit can keep its log handle open for a moment after exiting, so
-        # retry briefly rather than leaving a stray file in the machine folder.
+        # WinAudit can hold its log handle open for a moment after exiting, so
+        # retry rather than leave a stray file behind.
         for ($attempt = 1; $attempt -le 10; $attempt++) {
             Remove-Item -LiteralPath $fmtLog -Force -ErrorAction SilentlyContinue
             if (-not (Test-Path -LiteralPath $fmtLog)) { break }
@@ -1030,9 +992,9 @@ function Invoke-AuditTools {
 
     $script:DiskInfoDest = Join-Path $ExportDir "${Hostname}_diskinfo.txt"
 
-    # Delete any DiskInfo.txt left behind by an earlier run. Without this, a
-    # failed run on this machine would silently hand you the *previous*
-    # machine's SMART data filed under this hostname.
+    # Clear out any DiskInfo.txt from an earlier run. Without this, a failed
+    # run here would quietly hand you the previous machine's SMART data filed
+    # under this hostname.
     if (Test-Path -LiteralPath $DiskInfoTxtSrc) {
         Remove-Item -LiteralPath $DiskInfoTxtSrc -Force -ErrorAction SilentlyContinue
         Write-Log 'Removed a stale DiskInfo.txt before running CrystalDiskInfo.'
@@ -1073,10 +1035,9 @@ if (-not $isElevated) {
     exit 3
 }
 
-# Check the tools are here before making anyone answer seven questions.
-# Checked on its own first: if apps\ never made it onto the stick then every
-# check below fails at once, and "everything is missing" hides the one thing
-# actually wrong.
+# Check the tools are here before making anyone answer ten questions. apps\
+# gets its own check first - if it never made it onto the stick, every check
+# below fails at once and "everything is missing" hides the real problem.
 if (-not (Test-Path -LiteralPath $AppsDir)) {
     Write-Fail 'The apps\ folder is missing, so none of the audit tools are here.'
     Write-Info "Expected it at: $AppsDir"
@@ -1105,7 +1066,7 @@ if ($missing.Count -gt 0) {
     exit 4
 }
 
-# Confirm the stick is writable now, rather than after the interview.
+# Check the stick is writable now rather than after the questions.
 try {
     $probe = Join-Path $ScriptDir ('.write_test_{0}' -f [Guid]::NewGuid().ToString('N'))
     Set-Content -LiteralPath $probe -Value 'test' -Encoding ASCII
@@ -1119,11 +1080,10 @@ try {
     exit 5
 }
 
-# One folder per machine. If this machine has already been audited from
-# this stick, keep the old folder and put the new run beside it rather
-# than overwriting work.
-# Machine folders live under RESULTS so the root stays just the tools.
-# Created if absent, in case only the files get copied to a fresh stick.
+# One folder per machine, under RESULTS so the root stays clean. If this
+# machine was already audited from this stick, keep the old folder and put the
+# new run next to it rather than overwriting it. RESULTS is created if it isn't
+# there, in case only the files got copied to a fresh stick.
 $ResultsDir = Join-Path $ScriptDir 'RESULTS'
 if (-not (Test-Path -LiteralPath $ResultsDir)) {
     New-Item -ItemType Directory -Path $ResultsDir -Force | Out-Null
@@ -1138,8 +1098,8 @@ if (Test-Path -LiteralPath $OutDir) {
 }
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
-# Everything the tools produce goes one level down, in exports. That keeps
-# the machine folder itself free for the summary report.
+# Tool output goes a level down in exports\, leaving the machine folder itself
+# for the summary report.
 $ExportDir = Join-Path $OutDir 'exports'
 New-Item -ItemType Directory -Path $ExportDir -Force | Out-Null
 
@@ -1148,9 +1108,9 @@ Write-Log "Audit started on $Hostname"
 Write-Log "Script folder: $ScriptDir"
 Write-Log "Output folder: $OutDir"
 Write-Log "User running the script: $($identity.Name)"
-# Recorded explicitly so nobody has to work out after the fact whether a
-# report is complete. Log the measured value rather than asserting "Yes",
-# even though the check above means it can only ever be true here.
+# Logged so nobody has to work out later whether a report is complete. Log the
+# measured value, not a hardcoded "Yes", even though the check above means it
+# can only be true here.
 Write-Log "Running elevated: $(if ($isElevated) { 'Yes' } else { 'No' })"
 
 Write-Info "Results folder: $OutDir"
@@ -1161,9 +1121,9 @@ Write-Info "Results folder: $OutDir"
 
 $answers = $null
 
-# The form is the default front end. -Console asks for the original prompts
-# outright, and Get-AnswersGui returns $null when no form can be shown, so
-# either way the interview below runs only when it is actually needed.
+# The form is the default. -Console skips it, and Get-AnswersGui returns $null
+# if no form can be shown - either way the questions below only run when
+# they're actually needed.
 if (-not $Console) { $answers = Get-AnswersGui }
 
 while ($null -eq $answers) {
@@ -1227,8 +1187,7 @@ while ($null -eq $answers) {
         'Audit date'           = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     }
 
-    # Nothing has been written yet, so a mistyped answer at question 1 is
-    # still fixable here.
+    # Nothing is written yet, so a typo back at question 1 is still fixable.
     Write-Title 'REVIEW'
     foreach ($key in $answers.Keys) {
         Write-Host ('  {0,-24} {1}' -f $key, $answers[$key]) -ForegroundColor White
@@ -1236,7 +1195,7 @@ while ($null -eq $answers) {
     Write-Host ''
     if (Read-YesNo 'Is all of the above correct?') { break }
 
-    # Throw the rejected set away so the loop condition sends us round again.
+    # Bin the rejected set so the loop condition sends us round again.
     $answers = $null
     Write-Host ''
     Write-Warn 'Starting the questions again.'
@@ -1245,8 +1204,8 @@ while ($null -eq $answers) {
 # ==================================================================
 #  Save the manual answers FIRST
 #
-#  This is the expensive data - a person typed it. It must survive
-#  anything the audit tools do next.
+#  This is the expensive data - somebody typed it. It has to survive whatever
+#  the audit tools do next.
 # ==================================================================
 
 $manualTxt = Join-Path $ExportDir "${Hostname}_manual.txt"
@@ -1273,8 +1232,8 @@ Save-Log
 #  Automated tools
 # ==================================================================
 
-# The GUI's "Run audit apps" button may already have done all of this while
-# the questions were being answered. Only run it here if it did not.
+# The GUI's "Run audit apps" button may already have done this while the
+# questions were being answered. Only run it here if it didn't.
 if (-not $script:ToolsHaveRun) {
     Invoke-AuditTools -Title 'PART 2 OF 2  -  RUNNING APPLICATIONS AUDIT'
 } else {
@@ -1285,9 +1244,9 @@ if (-not $script:ToolsHaveRun) {
 # ==================================================================
 #  REPORT_SUMMARY.txt
 #
-#  Reads the finished exports back and pulls the interesting parts into
-#  one readable file, which sits above the exports folder. Runs last so
-#  every source it needs already exists.
+#  Reads the finished exports back and pulls the interesting parts into one
+#  readable file, which sits above exports\. Runs last so everything it needs
+#  already exists.
 # ==================================================================
 
 Write-Host ''
@@ -1315,11 +1274,10 @@ Add-Report "  COMPUTER AUDIT SUMMARY  -  $Hostname"
 Add-Report "  $($answers['Audit date'])"
 Add-Report $rule
 
-# The answers are still in memory, so there is no need to parse the file
-# we just wrote.
+# Answers are still in memory, so no need to parse the file we just wrote.
 Add-ReportHeading 'TECHNICIAN NOTES'
-# Width comes from the longest label so adding a question later cannot
-# knock the column out of line.
+# Width comes from the longest label, so adding a question later can't knock
+# the column out of line.
 $notePad = 22
 foreach ($key in $answers.Keys) { if ($key.Length -gt $notePad) { $notePad = $key.Length } }
 foreach ($key in $answers.Keys) {

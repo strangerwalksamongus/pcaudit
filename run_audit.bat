@@ -4,16 +4,15 @@ setlocal enabledelayedexpansion
 rem ============================================================
 rem  run_audit.bat
 rem
-rem  Launcher for run_audit.ps1. Its only jobs are:
-rem    1. make sure we are running as administrator
+rem  Launcher for run_audit.ps1. Two jobs only:
+rem    1. make sure we're running as administrator
 rem    2. start PowerShell with the execution policy bypassed
 rem
-rem  Every path is derived from %~dp0 (the folder this file lives
-rem  in), never from the current directory. That is what makes the
-rem  USB drive letter irrelevant, and it is what keeps things
-rem  working after UAC elevation - an elevated process starts with
-rem  its working directory set to C:\Windows\System32, so anything
-rem  relative would resolve to the wrong disk entirely.
+rem  Paths come from %~dp0 (this file's folder), never the current
+rem  directory. That's what makes the USB drive letter irrelevant,
+rem  and what keeps it working after UAC - an elevated process
+rem  starts in C:\Windows\System32, so anything relative would
+rem  resolve to the wrong disk.
 rem ============================================================
 
 title Computer Audit
@@ -32,17 +31,14 @@ if not exist "%PS_SCRIPT%" (
 )
 
 rem ------------------------------------------------------------------
-rem  Separate our own re-entry marker from arguments meant for the PS1.
+rem  Split our own re-entry marker from arguments meant for the PS1.
 rem
-rem  --elevated is internal to THIS file. run_audit.ps1 has no parameter
-rem  by that name, so forwarding it would make PowerShell reject the call
-rem  before the script ran at all. Elevation is unaffected either way -
-rem  the elevated copy still runs the entire audit, exactly as before.
+rem  --elevated is internal to this file. run_audit.ps1 has no parameter
+rem  by that name, so forwarding it would make PowerShell reject the
+rem  call before the script even ran. Elevation itself is unaffected.
 rem
-rem  Everything else is passed straight through, so:
-rem      run_audit.bat -Console
-rem  elevates as usual and then asks the questions in the console rather
-rem  than on the form.
+rem  Everything else passes straight through, so run_audit.bat -Console
+rem  elevates as usual then asks the questions in the console.
 rem ------------------------------------------------------------------
 set "PS_ARGS="
 set "WAS_ELEVATED="
@@ -53,13 +49,12 @@ shift
 goto parse_args
 :args_done
 
-rem --- Are we elevated? "net session" only succeeds as administrator. ---
+rem --- Elevated? "net session" only succeeds as administrator. ---
 net session >nul 2>&1
 if %ERRORLEVEL% equ 0 goto :run_audit
 
-rem --- Already tried to elevate once and still not admin: give up.
-rem     Tested through the variable, not %1 - shift has consumed the
-rem     arguments by this point. ---
+rem --- Tried elevating once and still not admin, so give up. Tested via
+rem     the variable, not %1 - shift has eaten the arguments by now. ---
 if defined WAS_ELEVATED (
     echo.
     echo   ERROR: Administrator rights are required, but this process is
@@ -88,7 +83,7 @@ if %ERRORLEVEL% neq 0 (
     exit /b 3
 )
 
-rem The elevated copy is doing the work now; this one is done.
+rem The elevated copy is doing the work now, so this one is done.
 exit /b 0
 
 :run_audit
